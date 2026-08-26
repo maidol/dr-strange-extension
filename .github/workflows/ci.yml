@@ -128,7 +128,7 @@ jobs:
       - uses: extractions/setup-just@v3
       - name: Build every component
         run: |
-          for plugin in toml rust ts py c java web go; do
+          for plugin in toml rust ts py c java web go git; do
             echo "::group::$plugin"
             just "${plugin}-plugin"
             echo "::endgroup::"
@@ -142,4 +142,5 @@ jobs:
                  plugins/c/component/target/wasm32-wasip2/release/drsg_plugin_c.wasm \
                  plugins/java/component/target/wasm32-wasip2/release/drsg_plugin_java.wasm \
                  plugins/web/component/target/wasm32-wasip2/release/drsg_plugin_web.wasm \
-                 plugins/go/component/go.wasm
+                 plugins/go/component/go.wasm \
+                 plugins/git/component/target/wasm32-wasip2/release/drsg_plugin_git.wasm
