@@ -56,6 +56,14 @@ every load.
 | `c` | `.c .h` | [tree-sitter-c](https://github.com/tree-sitter/tree-sitter-c) | [latest](https://github.com/wangyingsm/dr-strange-extension/releases?q=c-v&expanded=true) |
 | `web` | `.html .htm .css` | tree-sitter html/css/js — one plugin, so `class="btn"` binds to the stylesheet that defines `.btn` | [latest](https://github.com/wangyingsm/dr-strange-extension/releases?q=web-v&expanded=true) |
 | `toml` | `.toml` | [toml](https://crates.io/crates/toml) — the smallest plugin that is still a plugin | [latest](https://github.com/wangyingsm/dr-strange-extension/releases?q=toml-v&expanded=true) |
+| `git` | *no extension* — a repository, by its `.git` | its own reader for git's object store, packs, refs and reflog; no `git` binary is run | [latest](https://github.com/wangyingsm/dr-strange-extension/releases?q=git-v&expanded=true) |
+
+`git` is the one that claims no extension, because its input is not a file:
+digesting a directory that has a git directory in it also reads that
+repository's **history** — commits, branches, tags, merges, and the rebases
+only the reflog remembers — into a plane of its own, `<plane>_git`. Facts
+only, and no `git` binary: it reads the object store itself, from inside the
+sandbox, through the same `list`/`read` grant every other plugin has.
 
 Each *latest* link filters the [releases page](https://github.com/wangyingsm/dr-strange-extension/releases)
 to that plugin's tags, newest first; every release carries the `<plugin>.wasm`

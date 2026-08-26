@@ -21,6 +21,7 @@ on:
       - "c-v*"
       - "web-v*"
       - "toml-v*"
+      - "git-v*"
 
 permissions:
   contents: write # create the GitHub Release and upload assets
@@ -45,7 +46,7 @@ jobs:
           case "$plugin" in
             toml)  artifact="plugins/toml/target/wasm32-wasip2/release/drsg_plugin_toml.wasm" ;;
             go)    artifact="plugins/go/component/go.wasm" ;;
-            rust|ts|py|c|java|web)
+            rust|ts|py|c|java|web|git)
                    artifact="plugins/$plugin/component/target/wasm32-wasip2/release/drsg_plugin_$plugin.wasm" ;;
             *)     echo "unknown plugin in tag: $tag"; exit 1 ;;
           esac

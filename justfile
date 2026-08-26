@@ -60,6 +60,11 @@ java-plugin:
 toml-plugin:
     cd plugins/toml && cargo build --release --target wasm32-wasip2
 
+# The git plugin: pure Rust, no grammar and no C, because what it reads is a
+# binary format rather than a language.
+git-plugin:
+    cd plugins/git/component && cargo build --release --target wasm32-wasip2
+
 # Every native test suite: the parsers prove their facts without a wasm
 # toolchain anywhere near them.
 test:
@@ -70,6 +75,7 @@ test:
     cd plugins/java/parser && cargo test
     cd plugins/c/parser && cargo test
     cd plugins/web/parser && cargo test
+    cd plugins/git/parser && cargo test
 
 # The P0 eval board: every known resolution gap as an ignored test, red
 # until its phase lands. Failing here is the expected state — this recipe

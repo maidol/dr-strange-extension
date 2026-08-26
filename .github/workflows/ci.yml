@@ -52,6 +52,7 @@ jobs:
             plugins/java/parser
             plugins/c/parser
             plugins/web/parser
+            plugins/git/parser
             plugins/toml
       # Standalone crates, deliberately (each ships at its own pace), so the
       # gate loops rather than relying on a workspace.
@@ -60,7 +61,7 @@ jobs:
           for dir in sdk/rust \
                      plugins/rust/parser plugins/ts/parser plugins/py/parser \
                      plugins/java/parser plugins/c/parser plugins/web/parser \
-                     plugins/toml; do
+                     plugins/git/parser plugins/toml; do
             echo "::group::$dir"
             (cd "$dir" && cargo fmt --check && cargo clippy --all-targets && cargo test)
             echo "::endgroup::"
@@ -102,6 +103,7 @@ jobs:
             plugins/java/component
             plugins/c/component
             plugins/web/component
+            plugins/git/component
             plugins/toml
       - uses: actions/setup-go@v5
         with:

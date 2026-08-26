@@ -51,6 +51,13 @@
 | `c` | `.c .h` | [tree-sitter-c](https://github.com/tree-sitter/tree-sitter-c) | [最新版](https://github.com/wangyingsm/dr-strange-extension/releases?q=c-v&expanded=true) |
 | `web` | `.html .htm .css` | tree-sitter html/css/js —— 一个插件同时处理两种语言，`class="btn"` 才能绑定到定义 `.btn` 的样式表 | [最新版](https://github.com/wangyingsm/dr-strange-extension/releases?q=web-v&expanded=true) |
 | `toml` | `.toml` | [toml](https://crates.io/crates/toml) —— 最小的、但仍然完整的插件 | [最新版](https://github.com/wangyingsm/dr-strange-extension/releases?q=toml-v&expanded=true) |
+| `git` | *无扩展名* —— 以 `.git` 认出的仓库 | 自带的 git 对象库、pack、引用与 reflog 读取实现；不运行 `git` 可执行文件 | [最新版](https://github.com/wangyingsm/dr-strange-extension/releases?q=git-v&expanded=true) |
+
+`git` 是唯一不声明扩展名的插件，因为它的输入不是文件：digest 一个含有 git
+目录的目录时，会把该仓库的**历史**——提交、分支、标签、合并，以及只有
+reflog 还记得的变基——一并读进它自己的 plane，即 `<plane>_git`。只产出事实，
+且不运行 `git`：它在沙箱内、通过与其他插件相同的 `list`/`read` 授权，自己
+读对象库。
 
 每个「最新版」链接会将[发布页](https://github.com/wangyingsm/dr-strange-extension/releases)
 过滤到该插件的标签，最新的排在最前；每个发布都带有 `<plugin>.wasm` 与其

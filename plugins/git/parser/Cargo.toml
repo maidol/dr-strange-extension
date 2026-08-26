@@ -1,0 +1,21 @@
+[package]
+name = "drsg-git-parser"
+description = "A repository's history → graph facts, read straight out of `.git` — the parsing half of the drsg git plugin"
+version = "1.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+# Deliberately free of every dr-strange crate: facts are the JSON the contract
+# carries and host access is one small trait, which is what lets these tests
+# run natively — against real repositories built by the `git` binary — while
+# the component wraps the same code for wasm.
+[dependencies]
+# Loose objects and packed entries are zlib streams. The pure-Rust backend,
+# not zlib-ng: this compiles to wasm32-wasip2, where a C dependency would need
+# a sysroot to be one more thing standing between the sandbox and a commit.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[workspace]
+members = []
