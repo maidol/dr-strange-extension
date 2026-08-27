@@ -15,6 +15,7 @@
 package parser
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/printer"
@@ -22,6 +23,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // Files is what the parser reads through — the plugin contract's host, as
@@ -511,7 +513,9 @@ func (w *walker) typeSpec(d *ast.GenDecl, s *ast.TypeSpec) {
 // valueSpec records consts and vars the way the Rust parser records `const`
 // and `static`: the type as written under `signature`, and the initializer
 // as written under `value` — never evaluated, because `256 * 1024` folded
-// wrongly is worse than the expression that produced it.
+// wrongly is worse than the expression that produced it. "As written" is
+// meant literally: the value is the file's own bytes, cut at
+// [maxValueBytes]. See [walker.setValue] for why it is not printed.
 func (w *walker) valueSpec(d *ast.GenDecl, s *ast.ValueSpec, values []ast.Expr, typ ast.Expr) {
 	// A package-level var's stated type or initializer types it for every
 	// function in the package (Caller "" = package scope). Consts are basic
@@ -551,11 +555,11 @@ func (w *walker) valueSpec(d *ast.GenDecl, s *ast.ValueSpec, values []ast.Expr, 
 		props := w.props(signature, doc, id.Name)
 		switch {
 		case len(values) == len(s.Names):
-			props["value"] = w.print(values[i])
+			w.setValue(props, values[i])
 		case len(values) > 0:
 			// One expression, several names — `var a, b = f()`. The
 			// initializer as written is the fact for each of them.
-			props["value"] = w.print(values[0])
+			w.setValue(props, values[0])
 		}
 		w.node(w.pkg, w.pkg+"."+id.Name, label, props, w.line(id))
 	}
@@ -797,6 +801,107 @@ func (w *walker) print(n ast.Node) string {
 		return ""
 	}
 	return b.String()
+}
+
+// Past this many bytes an initializer has stopped describing a declaration
+// and started being the data. Generated code is where that happens:
+// protoc-gen-go writes a descriptor blob as one string concatenation
+// hundreds of terms long, and a `value` carrying a hundred kilobytes of
+// escaped bytes costs every reader of the graph and tells none of them
+// anything a prefix would not.
+const maxValueBytes = 1024
+
+// setValue records an initializer as written — by offset, not by printing.
+//
+// [walker.print] re-renders an expression from the AST, and go/printer does
+// it recursively: one frame per level, so `a + b + c + …` costs a frame per
+// term. That is affordable on a host and fatal in a plugin, whose stack is
+// fixed when it is linked (64 KiB here), sits at the bottom of linear memory
+// and has no guard page under it — it wraps past zero and surfaces as an
+// out-of-bounds access with no mention of a stack. One generated file used
+// to refuse the whole repository that way.
+//
+// The bytes are already in hand and need no walk at all. For gofmt'd input —
+// which generated code always is — the slice is byte for byte what the
+// printer would have produced, because the printer reproduces the original
+// line breaks from these same positions.
+func (w *walker) setValue(props Props, e ast.Expr) {
+	from := w.fset.Position(exprStart(e)).Offset
+	to := w.fset.Position(exprEnd(e)).Offset
+	if from < 0 || to > len(w.src) || from >= to {
+		return
+	}
+	text := string(w.src[from:to])
+	if len(text) > maxValueBytes {
+		cut := maxValueBytes
+		for cut > 0 && !utf8.RuneStart(text[cut]) {
+			cut--
+		}
+		text = fmt.Sprintf("%s… (%d more bytes, elided)", text[:cut], len(text)-cut)
+	}
+	props["value"] = text
+}
+
+// exprStart is `e.Pos()` with the recursion taken out.
+//
+// Several ast nodes answer Pos() by asking their leftmost child: BinaryExpr
+// returns X.Pos(), and in `a + b + c` that X is another BinaryExpr. So the
+// depth of the expression is the depth of the call stack — the same
+// pathology as printing it, in a much cheaper frame, but on the same fixed
+// stack. Walking the spine in a loop costs one frame at any depth.
+func exprStart(e ast.Expr) token.Pos {
+	for {
+		switch x := e.(type) {
+		case nil:
+			return token.NoPos
+		case *ast.BinaryExpr:
+			e = x.X
+		case *ast.CallExpr:
+			e = x.Fun
+		case *ast.SelectorExpr:
+			e = x.X
+		case *ast.IndexExpr:
+			e = x.X
+		case *ast.IndexListExpr:
+			e = x.X
+		case *ast.SliceExpr:
+			e = x.X
+		case *ast.TypeAssertExpr:
+			e = x.X
+		case *ast.KeyValueExpr:
+			e = x.Key
+		case *ast.CompositeLit:
+			if x.Type == nil {
+				return x.Lbrace
+			}
+			e = x.Type
+		default:
+			return e.Pos()
+		}
+	}
+}
+
+// exprEnd is `e.End()`, the same spine walked from the other side. A `+`
+// chain leans left, so its End() is shallow where its Pos() is deep — but
+// unary operators and key-value pairs lean the other way, and symmetry here
+// costs nothing.
+func exprEnd(e ast.Expr) token.Pos {
+	for {
+		switch x := e.(type) {
+		case nil:
+			return token.NoPos
+		case *ast.BinaryExpr:
+			e = x.Y
+		case *ast.KeyValueExpr:
+			e = x.Value
+		case *ast.UnaryExpr:
+			e = x.X
+		case *ast.StarExpr:
+			e = x.X
+		default:
+			return e.End()
+		}
+	}
 }
 
 // receiverBase unwraps a receiver type down to the identifier it names:

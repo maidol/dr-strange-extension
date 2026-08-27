@@ -808,3 +808,50 @@ func TestClosureParamsTypeReceivers(t *testing.T) {
 		t.Fatalf("a typed closure param dispatches: %v", a.Edges)
 	}
 }
+
+// A generated descriptor blob is one string concatenation hundreds of terms
+// deep. go/printer rendered it by recursing once per term, which overflowed
+// the stack the plugin is linked with and refused the whole repository —
+// so the initializer is taken from the source by offset instead, which
+// walks nothing. And it is capped, because past a point the initializer has
+// stopped describing the declaration and started being the data.
+func TestADeepInitializerIsReadFromSourceAndCapped(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("package m\n\nvar rawDesc = \"\"")
+	for i := 0; i < 2000; i++ {
+		b.WriteString(" +\n\t\"\\n\\x1fchunk\"")
+	}
+	b.WriteString("\n")
+	a := run(t, mapFiles{files: map[string]string{"go.mod": "module m", "d.go": b.String()}})
+
+	got, _ := node(t, a, "m.rawDesc").Props["value"].(string)
+	if got == "" {
+		t.Fatal("a deep initializer should still be recorded, not dropped")
+	}
+	if len(got) > maxValueBytes+64 {
+		t.Fatalf("value should be capped, got %d bytes", len(got))
+	}
+	if !strings.HasPrefix(got, "\"\" +\n\t\"\\n\\x1fchunk\"") {
+		t.Fatalf("the cap keeps the head of the initializer: %.40q", got)
+	}
+	if !strings.Contains(got, "more bytes, elided") {
+		t.Fatalf("a cut value should say it was cut: %.80q", got)
+	}
+}
+
+// The value is the file's own bytes, so an initializer that spans lines
+// comes back spanning lines — and one that fits is untouched.
+func TestAValueIsTheSourceAsWritten(t *testing.T) {
+	a := run(t, mapFiles{files: map[string]string{
+		"go.mod": "module m",
+		"v.go": "package m\n\nvar table = []int{\n\t1,\n\t2,\n}\n\n" +
+			"var chain = a.b.c.d()\n\nvar a struct{ b struct{ c struct{ d func() int } } }\n",
+	}})
+	if v := node(t, a, "m.table"); v.Props["value"] != "[]int{\n\t1,\n\t2,\n}" {
+		t.Fatalf("a multi-line initializer is kept as written: %q", v.Props["value"])
+	}
+	// A selector chain is the other shape whose Pos() recurses.
+	if v := node(t, a, "m.chain"); v.Props["value"] != "a.b.c.d()" {
+		t.Fatalf("a selector chain reads back whole: %q", v.Props["value"])
+	}
+}
