@@ -23,9 +23,36 @@ go-bindings:
 # collector still trapped under wasmexport; the host runs every call in a
 # fresh store, so what leaks dies with the call and the store's memory limit
 # is the bound.
+#
+# `wasip2-deep-stack.json` for the stack, because go/parser and go/printer
+# recurse over the shape of what they read and this stack is not the host's
+# to grow: it is fixed when the plugin is linked, sits at the bottom of
+# linear memory (`--stack-first`), and has no guard page under it — so
+# exhausting it walks the stack pointer past zero, wraps, and faults as an
+# out-of-bounds access that never says "stack". `Config::max_wasm_stack` is a
+# different stack and does nothing here. At the 64 KiB default a nested
+# composite literal traps between 120 and 160 levels deep, measured; 1 MiB
+# buys about sixteen times that, for fifteen more pages of a store whose
+# limit is gigabytes.
+#
+# It has to be a target file. TinyGo's own `-stack-size` is the *goroutine*
+# stack — under `-scheduler=none` there are no goroutines and it changes
+# nothing, verified: the build accepts `-stack-size=1MB` and still emits
+# `__stack_pointer = 65536`. What sets the wasm stack is wasm-ld's
+# `-z stack-size`, which TinyGo never passes, so the target adds it.
+#
+# Hence the assertion, which is how that was caught and is how the next
+# silent revert will be. wasm-tools is already a build dependency — TinyGo's
+# wasip2 target shells out to it to lift the module into a component.
+#
+# Build the Go plugin: no scheduler, leaking GC, and a 1 MiB guest stack.
 go-plugin:
-    cd plugins/go/component && tinygo build -target=wasip2 -scheduler=none -gc=leaking \
+    cd plugins/go/component && tinygo build -target=wasip2-deep-stack.json \
+        -scheduler=none -gc=leaking \
         --wit-package ./wit --wit-world drsg:preprocess-build/plugin-go -o go.wasm .
+    @wasm-tools print plugins/go/component/go.wasm \
+        | grep -q '__stack_pointer.*i32.const 1048576' \
+        || { echo "go-plugin: the guest stack is not 1 MiB — see wasip2-deep-stack.json" >&2; exit 1; }
 
 # Build the Rust plugins.
 rust-plugin:

@@ -1,0 +1,4 @@
+{
+	"inherits": ["wasip2"],
+	"ldflags": ["-z", "stack-size=1048576"]
+}
