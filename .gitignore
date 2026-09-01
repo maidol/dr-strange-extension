@@ -1,2 +1,13 @@
 target/
 plugins/go/component/go.wasm
+
+# Local database files created by drsg / serve watch, plus its sidecars.
+*.drsg
+*.drsg.jsonl
+*.drsg.hnsw
+*.drsg.bm25
+logs/
+
+# Local MCP server registration — carries a bearer token for a `serve watch`
+# instance bound to an ephemeral, machine-local port. Never share or commit.
+.mcp.json
