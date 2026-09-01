@@ -1,0 +1,87 @@
+{
+  "schema": 1,
+  "contract": "1.0.0",
+  "plugins": [
+    {
+      "name": "rust",
+      "version": "1.4.1",
+      "claims": ".rs",
+      "url": "https://github.com/wangyingsm/dr-strange-extension/releases/download/rust-v1.4.1/rust.wasm",
+      "sha256": "8e3c32be0add9c720c7f641de89e14edff72600e24c20ba1e903fa9bb573b7ff",
+      "contract": "1.0.0",
+      "min_drsg": "2.0.0"
+    },
+    {
+      "name": "go",
+      "version": "1.4.0",
+      "claims": ".go",
+      "url": "https://github.com/wangyingsm/dr-strange-extension/releases/download/go-v1.4.0/go.wasm",
+      "sha256": "121f585f61730ebdae67b4b132c8e8ea07fb4a8db314a7eacb81868fa8c3ada7",
+      "contract": "1.0.0",
+      "min_drsg": "2.0.0"
+    },
+    {
+      "name": "ts",
+      "version": "1.3.0",
+      "claims": ".ts .tsx .mts .cts .js .jsx .mjs .cjs",
+      "url": "https://github.com/wangyingsm/dr-strange-extension/releases/download/ts-v1.3.0/ts.wasm",
+      "sha256": "f9bcbeff9f244fd3abb9110d0c5c83974f3c40e509b8f1503e0c41350af42406",
+      "contract": "1.0.0",
+      "min_drsg": "2.0.0"
+    },
+    {
+      "name": "py",
+      "version": "1.3.0",
+      "claims": ".py .pyi .pyw",
+      "url": "https://github.com/wangyingsm/dr-strange-extension/releases/download/py-v1.3.0/py.wasm",
+      "sha256": "bcf0428bd5ba7ca99371ff9389db4d00cb0dd63a4edcf82e77b5dfa77fb88d0b",
+      "contract": "1.0.0",
+      "min_drsg": "2.0.0"
+    },
+    {
+      "name": "java",
+      "version": "1.2.0",
+      "claims": ".java",
+      "url": "https://github.com/wangyingsm/dr-strange-extension/releases/download/java-v1.2.0/java.wasm",
+      "sha256": "26876c3e293b7b43dd7b52a3397b7e5301bd4a9984c36bc862c2bfcbb0ece2a5",
+      "contract": "1.0.0",
+      "min_drsg": "2.0.0"
+    },
+    {
+      "name": "c",
+      "version": "1.2.0",
+      "claims": ".c .h",
+      "url": "https://github.com/wangyingsm/dr-strange-extension/releases/download/c-v1.2.0/c.wasm",
+      "sha256": "92a17ae63eb4cea544cfa42dd3bc4957393e381644ac41523294d42cd1dd1663",
+      "contract": "1.0.0",
+      "min_drsg": "2.0.0"
+    },
+    {
+      "name": "web",
+      "version": "1.1.0",
+      "claims": ".html .htm .css",
+      "url": "https://github.com/wangyingsm/dr-strange-extension/releases/download/web-v1.1.0/web.wasm",
+      "sha256": "3b475f37294e3235650e95e540d4ce7d0ae3a53ab96f757a457172ad436d26ae",
+      "contract": "1.0.0",
+      "min_drsg": "2.0.0"
+    },
+    {
+      "name": "toml",
+      "version": "1.2.0",
+      "claims": ".toml",
+      "url": "https://github.com/wangyingsm/dr-strange-extension/releases/download/toml-v1.2.0/toml.wasm",
+      "sha256": "6af62778e48dc580a60762b6609134b36867b22d3123bdadcf611fb2ce22a9b8",
+      "contract": "1.0.0",
+      "min_drsg": "2.0.0"
+    },
+    {
+      "name": "git",
+      "version": "1.0.0",
+      "claims": "a repository's history",
+      "url": "https://github.com/wangyingsm/dr-strange-extension/releases/download/git-v1.0.0/git.wasm",
+      "sha256": "ce50d72fcfa5ad755b36a574c3cb4a37ede2837aa5ef579167b2aefdd0a3cd52",
+      "contract": "1.0.0",
+      "min_drsg": "2.2.0"
+    }
+  ]
+}

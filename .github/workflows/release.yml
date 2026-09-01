@@ -10,6 +10,12 @@ name: Release
 #   drsg plugin install https://github.com/<owner>/<repo>/releases/download/<tag>/<plugin>.wasm
 #
 # and drsg pins the hash at install, re-checking it at every load.
+#
+# The `catalog` job then writes the new version, URL and hash into
+# `catalog.json` on master — the list `drsg plugin install` reads, so a plugin
+# release reaches every installed drsg without a drsg release. It updates the
+# three mechanical fields and nothing else: `claims` and `min_drsg` are
+# judgements a person makes when a plugin first enters the catalog.
 on:
   push:
     tags:
@@ -24,7 +30,14 @@ on:
       - "git-v*"
 
 permissions:
-  contents: write # create the GitHub Release and upload assets
+  contents: write # create the GitHub Release, upload assets, commit the catalog
+
+# Two plugins tagged at once would otherwise race to commit `catalog.json`.
+# Queued rather than cancelled: a superseded run here means a release whose
+# catalog entry never lands.
+concurrency:
+  group: release-catalog
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -119,3 +132,72 @@ jobs:
           \`\`\`
 
           sha256: \`$sha\` — drsg pins this at install and re-checks it at every load."
+
+  catalog:
+    name: Record ${{ github.ref_name }} in catalog.json
+    needs: plugin
+    runs-on: ubuntu-latest
+    steps:
+      # master, not the tag: the tag is a detached point in history and the
+      # catalog lives on the branch.
+      - uses: actions/checkout@v5
+        with:
+          ref: master
+          # A push needs credentials that outlive the checkout step.
+          persist-credentials: true
+      - name: Update the entry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          plugin="${tag%%-v*}"
+          version="${tag#*-v}"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/${plugin}.wasm"
+
+          # The hash the release actually published — read back from the
+          # release rather than recomputed, so what the catalog pins is what
+          # an installer will download.
+          sha=$(gh release view "$tag" --json assets \
+                  -q '.assets[] | select(.name == "'"$plugin"'.wasm.sha256") | .url' \
+                | xargs curl -sSfL | cut -d' ' -f1)
+          if [ -z "$sha" ]; then
+            echo "::error::$tag published no $plugin.wasm.sha256 to pin"
+            exit 1
+          fi
+
+          rows=$(jq --arg n "$plugin" '[.plugins[] | select(.name == $n)] | length' catalog.json)
+          if [ "$rows" = "0" ]; then
+            echo "::warning::$plugin is not in catalog.json — add it by hand with its \`claims\` and \`min_drsg\`, which are judgements this workflow cannot make. The release is published either way; it just will not be offered by \`drsg plugin install\` until the entry exists."
+            exit 0
+          fi
+          if [ "$rows" != "1" ]; then
+            echo "::warning::catalog.json holds $rows entries for $plugin — several versions of one plugin is a deliberate compatibility arrangement, so this workflow will not guess which row to move. Update it by hand."
+            exit 0
+          fi
+
+          jq --arg n "$plugin" --arg v "$version" --arg u "$url" --arg s "$sha" \
+            '.plugins = [.plugins[] | if .name == $n then .version = $v | .url = $u | .sha256 = $s else . end]' \
+            catalog.json > catalog.tmp && mv catalog.tmp catalog.json
+
+          ./scripts/check-catalog.sh --online
+
+          if git diff --quiet catalog.json; then
+            echo "catalog.json already records $tag"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add catalog.json
+          git commit -m "chore(catalog): $plugin $version"
+          # Another plugin's release may have landed between the checkout and
+          # now; rebase onto it rather than failing the release over it.
+          for attempt in 1 2 3; do
+            if git pull --rebase --quiet origin master && git push origin HEAD:master; then
+              exit 0
+            fi
+            echo "push attempt $attempt lost a race — retrying"
+            sleep $((attempt * 5))
+          done
+          echo "::error::could not push the catalog entry for $tag after 3 attempts"
+          exit 1

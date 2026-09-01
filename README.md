@@ -67,15 +67,61 @@ sandbox, through the same `list`/`read` grant every other plugin has.
 
 Each *latest* link filters the [releases page](https://github.com/wangyingsm/dr-strange-extension/releases)
 to that plugin's tags, newest first; every release carries the `<plugin>.wasm`
-and its `.sha256`. The easiest path needs no URL at all: a bare
-`drsg plugin install` lists this catalog interactively, pinned to the
-versions known-good with your drsg build.
+and its `.sha256`. The easiest path needs no URL at all — a name is enough,
+and a bare `drsg plugin install` lists the catalog interactively:
 
 ```console
-$ drsg plugin install https://github.com/wangyingsm/dr-strange-extension/releases/download/<tag>/rust.wasm
-installed rust@2  sha256:8e3c32be0add
+$ drsg plugin install rust
+downloading https://github.com/wangyingsm/dr-strange-extension/releases/download/rust-v1.4.1/rust.wasm
+installed rust@1.4.1  sha256:8e3c32be0add
   handles: .rs
 ```
+
+## The catalog
+
+[`catalog.json`](catalog.json) in this repository **is** that list. It is what
+`drsg plugin install` reads and what the dashboard's Extensions panel shows;
+`drsg plugin list --available` prints it, tagged against what is installed
+locally.
+
+It lives here rather than in the database's source tree because it describes
+*these* releases. It used to be a table compiled into drsg, which made every
+plugin release a change to the database — tag `rust-v1.4.2` here, then edit a
+Rust file there, bump, ship — for a fact the host only repeats. Now nothing is
+repeated: cut the tag, and the `catalog` job writes the new version, URL and
+hash into this file.
+
+```json
+{
+  "name": "rust",
+  "version": "1.4.1",
+  "claims": ".rs",
+  "url": "https://github.com/wangyingsm/dr-strange-extension/releases/download/rust-v1.4.1/rust.wasm",
+  "sha256": "8e3c32be0add9c720c7f641de89e14edff72600e24c20ba1e903fa9bb573b7ff",
+  "contract": "1.0.0",
+  "min_drsg": "2.0.0"
+}
+```
+
+`version`, `url` and `sha256` are mechanical and the release workflow owns
+them. `claims` (what the installer's table prints) and `min_drsg` (the oldest
+drsg this artifact works with) are judgements, so a **new** plugin's first
+entry is added by hand — the workflow says so in the release log rather than
+inventing them. `contract` is the [WIT](wit/preprocess.wit) world the artifact
+was built against, and must match that file's package version.
+
+A host reads the entry before it downloads anything. It refuses an artifact
+whose bytes do not hash to `sha256`, and it *shows but warns about* an entry
+whose `min_drsg` or `contract` it cannot honour — a plugin missing from the
+list without explanation would be worse than one that says why it cannot run
+here. Several entries may share a `name`, which is how a plugin keeps serving
+older hosts: each host installs the newest entry it can run. The release
+workflow will not touch a plugin that has more than one entry, because that
+arrangement is deliberate.
+
+Nothing compiles this file, so CI checks it: `just check-catalog-online`
+validates every field and fetches each release's published checksum to confirm
+the pin. Run it before hand-editing.
 
 Every parser follows one discipline: keys are the language's *own* qualified
 names (`crate::module::fn`, `pkg.Type.Method`, `file.c::func`,

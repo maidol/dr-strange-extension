@@ -11,6 +11,17 @@ check-wit:
     diff -u wit/preprocess.wit sdk/go/wit/preprocess.wit
     diff -u wit/preprocess.wit plugins/go/component/wit/deps/preprocess/preprocess.wit
 
+# `catalog.json` is what `drsg plugin install` reads — the official list, kept
+# here rather than in the database's source tree so a plugin release needs no
+# drsg release. Shape only; `check-catalog-online` also verifies every pinned
+# hash against the release it names.
+check-catalog:
+    ./scripts/check-catalog.sh
+
+# What CI runs, and what to run before hand-editing catalog.json.
+check-catalog-online:
+    ./scripts/check-catalog.sh --online
+
 # Regenerate the Go SDK's bindings after a contract change. Needs
 # `wit-bindgen-go` (go install go.bytecodealliance.org/cmd/wit-bindgen-go@latest).
 go-bindings:

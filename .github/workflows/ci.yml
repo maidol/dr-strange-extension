@@ -34,6 +34,18 @@ jobs:
           diff -u wit/preprocess.wit sdk/go/wit/preprocess.wit
           diff -u wit/preprocess.wit plugins/go/component/wit/deps/preprocess/preprocess.wit
 
+  catalog:
+    name: Catalog — every official entry resolves to its release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # `catalog.json` is what `drsg plugin install` reads. Nothing compiles
+      # it, so this job is the only thing standing between a typo'd hash and
+      # an operator's failed install. `--online` fetches each release's
+      # published checksum and compares — nine tiny requests.
+      - name: check-catalog
+        run: ./scripts/check-catalog.sh --online
+
   rust:
     name: Rust — fmt, clippy, test (SDK + every parser)
     runs-on: ubuntu-latest

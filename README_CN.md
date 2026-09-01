@@ -61,14 +61,53 @@ reflog 还记得的变基——一并读进它自己的 plane，即 `<plane>_git
 
 每个「最新版」链接会将[发布页](https://github.com/wangyingsm/dr-strange-extension/releases)
 过滤到该插件的标签，最新的排在最前；每个发布都带有 `<plugin>.wasm` 与其
-`.sha256`。最省事的方式不需要任何 URL：不带参数的 `drsg plugin install`
-会交互式列出这份目录，固定在与你的 drsg 构建兼容的已验证版本上。
+`.sha256`。最省事的方式不需要任何 URL——一个名字就够了；不带参数的
+`drsg plugin install` 会交互式列出整份目录：
 
 ```console
-$ drsg plugin install https://github.com/wangyingsm/dr-strange-extension/releases/download/<tag>/rust.wasm
-installed rust@2  sha256:8e3c32be0add
+$ drsg plugin install rust
+downloading https://github.com/wangyingsm/dr-strange-extension/releases/download/rust-v1.4.1/rust.wasm
+installed rust@1.4.1  sha256:8e3c32be0add
   handles: .rs
 ```
+
+## 官方目录
+
+本仓库的 [`catalog.json`](catalog.json) **就是**那份列表。`drsg plugin install`
+读取它，仪表盘的 Extensions 面板展示它，`drsg plugin list --available` 打印它
+并标注本地已安装的状态。
+
+它放在这里而不是数据库的源码树里，因为它描述的是**这些** Release。它过去是编译
+进 drsg 的一张表，这使得每次插件发布都要改动数据库——在这边打 `rust-v1.4.2`
+标签，再去那边改一个 Rust 文件、升版本、发布——而宿主只是在重复一个既有事实。
+现在不再重复：打好标签，`catalog` 作业就把新的版本号、URL 与哈希写进这个文件。
+
+```json
+{
+  "name": "rust",
+  "version": "1.4.1",
+  "claims": ".rs",
+  "url": "https://github.com/wangyingsm/dr-strange-extension/releases/download/rust-v1.4.1/rust.wasm",
+  "sha256": "8e3c32be0add9c720c7f641de89e14edff72600e24c20ba1e903fa9bb573b7ff",
+  "contract": "1.0.0",
+  "min_drsg": "2.0.0"
+}
+```
+
+`version`、`url`、`sha256` 是机械事实，由发布流程负责。`claims`（安装器表格里
+打印的内容）与 `min_drsg`（该产物可用的最低 drsg 版本）属于判断，因此**新**插件
+的首个条目由人手添加——流程不会替你臆造，只会在发布日志里说明。`contract` 是产物
+构建时所依据的 [WIT](wit/preprocess.wit) world 版本，必须与该文件的 package
+版本一致。
+
+宿主在下载之前就会读这个条目：字节哈希与 `sha256` 不符即拒绝安装；`min_drsg` 或
+`contract` 无法满足时**照样列出，但给出警告**——一个不加解释就从列表里消失的插件，
+比一个明确说出自己为何在此不可用的插件更糟。多个条目可以共用同一个 `name`，这正是
+一个插件继续服务旧宿主的方式：每个宿主安装它能运行的最新条目。当某个插件拥有多个
+条目时，发布流程不会去动它，因为那是刻意的兼容安排。
+
+没有编译器会检查这个文件，所以由 CI 来检查：`just check-catalog-online` 校验每个
+字段，并抓取各 Release 已发布的校验和来确认哈希。手工编辑前请先运行它。
 
 所有解析器遵循同一条纪律：键（key）使用语言**自己的**全限定名
 （`crate::module::fn`、`pkg.Type.Method`、`file.c::func`、`index.html#map`），
