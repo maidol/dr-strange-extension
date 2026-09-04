@@ -1884,3 +1884,326 @@ fn closure_params_type_through_the_callees_declared_bound() {
     assert!(has_edge(&a, "k::run", "CALLS", "k::Plane::wipe"));
     assert!(has_edge(&a, "k::run_where", "CALLS", "k::Plane::wipe"));
 }
+
+/// A receiver whose type the body states — a parameter, an annotation, a
+/// constructor path — resolves into std and other crates too: the target is
+/// an external stand-in keyed `Type::method`, labelled as the method a call
+/// site proved it to be, and the edge says the receiver's type is what
+/// resolved it.
+#[test]
+fn a_typed_receiver_resolves_into_std() {
+    let t = Tree::new("ext-recv");
+    t.write("Cargo.toml", "[package]\nname = \"k\"\n").write(
+        "src/lib.rs",
+        concat!(
+            "use std::collections::HashMap;\n",
+            "pub fn go(s: &str, v: Vec<u8>) {\n",
+            "    s.trim();\n",
+            "    v.len();\n",
+            "    let mut w = Vec::new();\n",
+            "    w.push(1);\n",
+            "    let n = String::from(\"x\");\n",
+            "    n.as_str();\n",
+            "    let m: HashMap<u8, u8> = HashMap::new();\n",
+            "    m.get(&1);\n",
+            "    \"lit\".to_string();\n",
+            "}\n",
+        ),
+    );
+    let out = run(&t);
+    let calls: Vec<&str> = out
+        .edges
+        .iter()
+        .filter(|e| e.ty == "CALLS" && e.src == "k::go")
+        .map(|e| e.dst.as_str())
+        .collect();
+    for target in [
+        "str::trim",
+        "Vec::len",
+        "Vec::push",
+        "String::as_str",
+        // Expanded through the file's `use`, as a path call would be.
+        "std::collections::HashMap::get",
+        // A blanket trait's method is the trait's, wherever it is called.
+        "ToString::to_string",
+    ] {
+        assert!(calls.contains(&target), "{target} missing from {calls:?}");
+        let node = out.nodes.iter().find(|n| n.key == target).unwrap();
+        assert_eq!(node.label, "Method", "{target}");
+        assert_eq!(node.extra_labels, vec!["External".to_string()], "{target}");
+    }
+    let edge = out
+        .edges
+        .iter()
+        .find(|e| e.src == "k::go" && e.dst == "Vec::push")
+        .unwrap();
+    assert_eq!(
+        edge.props.get("_resolved_by"),
+        Some(&Value::String("external-receiver".into()))
+    );
+    // The `String::from` constructor is itself a path call, recorded as before.
+    assert!(calls.contains(&"String::from"), "{calls:?}");
+    // Nothing above went to the ledger.
+    assert!(
+        !calls.iter().any(|c| c.starts_with("?::")),
+        "every receiver was typed: {calls:?}"
+    );
+    every_edge_has_endpoints(&out);
+}
+
+/// A chain is typed hop by hop — `v.iter().map(…).collect()` — with each
+/// hop into std resolved to where std declares it: `Vec::iter`, then
+/// `Iterator::map` and `Iterator::collect`, since the adapter types are
+/// std's business and never spelled by the source.
+#[test]
+fn a_method_chain_is_typed_hop_by_hop() {
+    let t = Tree::new("ext-chain");
+    t.write("Cargo.toml", "[package]\nname = \"k\"\n").write(
+        "src/lib.rs",
+        concat!(
+            "pub struct Bag { pub items: Vec<u8> }\n",
+            "impl Bag {\n",
+            "    pub fn total(&self) -> usize { self.items.iter().map(|x| *x as usize).sum() }\n",
+            "    pub fn names(&self) -> Vec<String> { self.items.iter().map(|x| x.to_string()).collect() }\n",
+            "}\n",
+            "pub fn count(b: &Bag) -> usize { b.names().len() }\n",
+        ),
+    );
+    let out = run(&t);
+    let calls = |src: &str| -> Vec<String> {
+        out.edges
+            .iter()
+            .filter(|e| e.ty == "CALLS" && e.src == src)
+            .map(|e| e.dst.clone())
+            .collect()
+    };
+    let total = calls("k::Bag::total");
+    for target in ["Vec::iter", "Iterator::map", "Iterator::sum"] {
+        assert!(
+            total.contains(&target.to_string()),
+            "{target} missing from {total:?}"
+        );
+    }
+    let names = calls("k::Bag::names");
+    assert!(
+        names.contains(&"Iterator::collect".to_string()),
+        "{names:?}"
+    );
+    // A declared method's stated return types the next hop: `names()` is a
+    // `Vec<String>`, so `.len()` on it is `Vec::len`.
+    let count = calls("k::count");
+    assert!(count.contains(&"k::Bag::names".to_string()), "{count:?}");
+    assert!(count.contains(&"Vec::len".to_string()), "{count:?}");
+    every_edge_has_endpoints(&out);
+}
+
+/// A generic parameter states no type: `x: T` types nothing, so `x.m()`
+/// stays in the ledger rather than becoming a `T::m` that exists nowhere.
+/// Likewise a receiver nothing states the type of.
+#[test]
+fn generic_and_untyped_receivers_stay_in_the_ledger() {
+    let t = Tree::new("ext-generic");
+    t.write("Cargo.toml", "[package]\nname = \"k\"\n").write(
+        "src/lib.rs",
+        concat!(
+            "pub trait Tr { fn m(&self); }\n",
+            "pub fn go<T: Tr>(x: T, y: &impl Tr) { x.m(); y.m(); }\n",
+            "pub struct W<U>(U);\n",
+            "impl<U> W<U> { pub fn inner(&self, u: U) { u.m(); } }\n",
+            "pub fn other() { let z = unknown(); z.m(); }\n",
+        ),
+    );
+    let out = run(&t);
+    let targets: Vec<&str> = out
+        .edges
+        .iter()
+        .filter(|e| e.ty == "CALLS" && e.dst.ends_with("::m"))
+        .map(|e| e.dst.as_str())
+        .collect();
+    assert!(
+        targets.iter().all(|d| d.starts_with("?::")),
+        "a generic receiver is never typed: {targets:?}"
+    );
+    assert!(
+        !out.nodes.iter().any(|n| n.key == "T::m" || n.key == "U::m"),
+        "no method node for a type parameter"
+    );
+    every_edge_has_endpoints(&out);
+}
+
+/// A declared type still wins over an external one with the same short
+/// name, and a declared method still beats std's table: `.clone()` on a type
+/// that declares one lands on the declaration.
+#[test]
+fn declared_types_and_methods_beat_the_std_table() {
+    let t = Tree::new("ext-declared");
+    t.write("Cargo.toml", "[package]\nname = \"k\"\n").write(
+        "src/lib.rs",
+        concat!(
+            "pub struct Vec;\nimpl Vec { pub fn len(&self) -> usize { 0 } }\n",
+            "pub struct Txn;\nimpl Txn { pub fn clone(&self) -> Txn { Txn } pub fn commit(&self) {} }\n",
+            "pub fn go(v: &Vec, t: &Txn) { v.len(); t.clone().commit(); }\n",
+        ),
+    );
+    let out = run(&t);
+    assert!(has_edge(&out, "k::go", "CALLS", "k::Vec::len"));
+    assert!(has_edge(&out, "k::go", "CALLS", "k::Txn::clone"));
+    assert!(has_edge(&out, "k::go", "CALLS", "k::Txn::commit"));
+    assert!(
+        !out.nodes
+            .iter()
+            .any(|n| n.key == "Vec::len" || n.key == "Txn::clone"),
+        "nothing external was minted for a declared type"
+    );
+}
+
+/// `Box`, `Arc` and `Rc` are looked through to what they point at, as method
+/// resolution does by deref — `Arc<Mutex<T>>` answers `.lock()` as `Mutex`.
+/// A pointee that is not a path is no answer at all.
+#[test]
+fn smart_pointers_type_as_their_pointee() {
+    let t = Tree::new("ext-deref");
+    t.write("Cargo.toml", "[package]\nname = \"k\"\n").write(
+        "src/lib.rs",
+        concat!(
+            "use std::sync::{Arc, Mutex};\n",
+            "pub trait Tr { fn m(&self); }\n",
+            "pub fn go(a: Arc<Mutex<u8>>, b: Box<dyn Tr>) { a.lock(); b.m(); }\n",
+        ),
+    );
+    let out = run(&t);
+    assert!(
+        has_edge(&out, "k::go", "CALLS", "std::sync::Mutex::lock"),
+        "{:?}",
+        out.edges
+    );
+    assert!(
+        has_edge(&out, "k::go", "CALLS", "?::src/lib.rs::m"),
+        "a `Box<dyn Tr>` receiver is a trait object, typed by nobody here"
+    );
+}
+
+/// Resolution over a real tree, for eyeballing a change to receiver typing
+/// against a codebase rather than a fixture: `DRSG_EVAL_ROOT=<dir> cargo test
+/// -- --ignored eval_resolution --nocapture`. Prints how calls resolved and
+/// what still leads the ledger; asserts nothing beyond the graph being
+/// well-formed.
+#[test]
+#[ignore]
+fn eval_resolution_over_a_real_tree() {
+    let Ok(root) = std::env::var("DRSG_EVAL_ROOT") else {
+        eprintln!("DRSG_EVAL_ROOT not set — nothing to evaluate");
+        return;
+    };
+    let out = run_files(&TestFiles::rooted(root));
+    let mut by_strategy: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut ledger: std::collections::BTreeMap<String, usize> = Default::default();
+    for e in out.edges.iter().filter(|e| e.ty == "CALLS") {
+        let how = match e.props.get("_resolved_by") {
+            Some(Value::String(s)) => s.clone(),
+            _ => "unstamped".into(),
+        };
+        *by_strategy.entry(how).or_default() += 1;
+        if let Some(name) = e
+            .dst
+            .strip_prefix("?::")
+            .and_then(|k| k.rsplit("::").next())
+        {
+            *ledger.entry(name.to_string()).or_default() += 1;
+        }
+    }
+    let mut top: Vec<_> = ledger.into_iter().collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    eprintln!("nodes {} edges {}", out.nodes.len(), out.edges.len());
+    eprintln!(
+        "UnresolvedRef nodes {}",
+        out.nodes
+            .iter()
+            .filter(|n| n.label == "UnresolvedRef")
+            .count()
+    );
+    for (how, n) in &by_strategy {
+        eprintln!("  CALLS by {how}: {n}");
+    }
+    eprintln!("ledger leaders:");
+    for (name, n) in top.iter().take(25) {
+        eprintln!("  {n:5}  {name}");
+    }
+    for note in &out.notes {
+        eprintln!("note: {note}");
+    }
+    every_edge_has_endpoints(&out);
+}
+
+/// A hop into std that returns an `Option`, a `Result` or an iterator is a
+/// fact the parser carries, so the chain goes on: `map.get(k)` is an
+/// `Option`, and `.map(…)` on it is `Option::map`, `.unwrap()` is
+/// `Option::unwrap`. A method no declaration and no table knows stops the
+/// chain — `Type::method` is still recorded, since the type is known, but
+/// nothing after it is.
+#[test]
+fn std_returns_carry_a_chain_through_option_and_result() {
+    let t = Tree::new("ext-std-returns");
+    t.write("Cargo.toml", "[package]\nname = \"k\"\n").write(
+        "src/lib.rs",
+        concat!(
+            "use std::collections::HashMap;\n",
+            "#[derive(Clone)]\npub struct Txn;\n",
+            "pub fn open() -> Result<Txn, ()> { Ok(Txn) }\n",
+            "pub fn go(m: &HashMap<u8, u8>, s: &str, t: &Txn) {\n",
+            "    m.get(&1).map(|x| *x).unwrap();\n",
+            "    s.parse::<u8>().map_err(|e| e).unwrap_or_default();\n",
+            "    let r = open();\n",
+            "    r.is_ok();\n",
+            "    let c = t.clone();\n",
+            "    c.clone();\n",
+            "    s.chars().rev().count();\n",
+            "    s.find('x').unwrap_or(0).max(1);\n",
+            "}\n",
+        ),
+    );
+    let out = run(&t);
+    let calls: Vec<&str> = out
+        .edges
+        .iter()
+        .filter(|e| e.ty == "CALLS" && e.src == "k::go")
+        .map(|e| e.dst.as_str())
+        .collect();
+    for target in [
+        "std::collections::HashMap::get",
+        "Option::map",
+        "Option::unwrap",
+        "str::parse",
+        "Result::map_err",
+        "Result::unwrap_or_default",
+        // An un-peeled declared `Result<Txn>` return is a `Result`.
+        "Result::is_ok",
+        // `#[derive(Clone)]` writes no `fn clone`: the call is the trait's,
+        // and its result is the type again, so the second `.clone()` is too.
+        "Clone::clone",
+        "str::chars",
+        "Iterator::rev",
+        "Iterator::count",
+        "str::find",
+        "Option::unwrap_or",
+    ] {
+        assert!(calls.contains(&target), "{target} missing from {calls:?}");
+    }
+    let clone = out
+        .edges
+        .iter()
+        .find(|e| e.src == "k::go" && e.dst == "Clone::clone")
+        .unwrap();
+    assert_eq!(
+        clone.props.get("_resolved_by"),
+        Some(&Value::String("std-trait".into()))
+    );
+    assert_eq!(
+        clone.props.get("_confidence"),
+        Some(&Value::String("medium".into()))
+    );
+    // `unwrap_or(0)` hands back the Option's payload, which the parser has
+    // no type for — so `.max(1)` on it is in the ledger, not a guess.
+    assert!(calls.contains(&"?::src/lib.rs::max"), "{calls:?}");
+    every_edge_has_endpoints(&out);
+}

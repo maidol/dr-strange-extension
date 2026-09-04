@@ -72,8 +72,16 @@ carries `_code`: the source as written, described as retrieval-only — the
   needs).
 - A **bare name** binds by scope proximity; a name with two equally-close
   candidates is **ambiguous — counted, not guessed**.
-- A **method call** (`.read()`) names no path, and the receiver's type is
-  what a parser cannot know: counted, never guessed.
+- A **method call** (`.read()`) names no path; it resolves as far as the
+  receiver's type can be **read off the body** — a parameter or `let`
+  annotation, a field's declared type, a constructor path (`Vec::new()`), a
+  declared return, and chains of those (`self.items.iter().map(…)`), with
+  `?`/`.unwrap()` peeling a declared `Result`/`Option`. A type this tree
+  declares lands on its own method; a type it does not — std's, a
+  dependency's — lands on an external stand-in keyed `Type::method`
+  (`Vec::push`, `str::trim`, `Iterator::map`), which is all that is known
+  about it. A receiver whose type nothing states, or a generic parameter,
+  is **counted, never guessed**.
 - **Re-exports** (`pub use`, including `pub(crate) use`) create the facade
   paths later references resolve through.
 - A key seen twice is nearly always two `#[cfg]` alternatives of one item —
@@ -92,7 +100,9 @@ invocations.
 ## Build & test
 
 ```console
-$ cd parser    && cargo test          # 37 tests, no wasm toolchain
+$ cd parser    && cargo test          # native, no wasm toolchain
+$ DRSG_EVAL_ROOT=/path/to/a/tree cargo test -- --ignored eval_resolution --nocapture
+                                      # how calls resolve over a real tree, and what leads the ledger
 $ just rust-plugin                    # → component/target/wasm32-wasip2/release/drsg_plugin_rust.wasm
 $ drsg plugin install …/drsg_plugin_rust.wasm
 ```
@@ -105,5 +115,7 @@ plugin's own business; the host never looks inside.
 ## Known limits
 
 Macro-generated items are absent (marked by `INVOKES`); trait-method calls
-on generic receivers are method calls, hence counted; `#[cfg]` selection is
-not evaluated — both arms' items exist, duplicates counted.
+on generic receivers are method calls, hence counted; a chain through a std
+method whose return the parser has no fact for (`map.get(k)?.m()`) stops
+there; `#[cfg]` selection is not evaluated — both arms' items exist,
+duplicates counted.

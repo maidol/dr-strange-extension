@@ -22,8 +22,12 @@
 //! ## Two limits worth stating
 //!
 //! **Calls** resolve by written path, then by locality. A method call written
-//! `.read()` names no path, and the receiver's type is what a parser cannot
-//! know — those are counted, never guessed. **Properties** are JSON values in
+//! `.read()` names no path: it resolves when the body *states* the receiver's
+//! type — an annotation, a parameter, a field's declared type, a constructor
+//! path, a declared return — and that holds for std and other crates too,
+//! where the target is an external stand-in (`Vec::push`) rather than a
+//! declaration. A receiver nothing states the type of is counted, never
+//! guessed. **Properties** are JSON values in
 //! the shape the drsg contract carries (`$desc`/`$value` for described
 //! properties), because a property may hold a list or a map and the boundary
 //! has no recursive types.
@@ -192,17 +196,18 @@ pub struct FileFacts {
 /// A path call writes where it is going — `std::fs::read(…)`, `Vec::new()`,
 /// or a bare name the file imported — and that path is enough to record the
 /// callee even when it lives in another crate. A method call writes only
-/// `.read()`, and the receiver's type is exactly what a parser does not know,
-/// so those stay unresolved rather than becoming a guess.
+/// `.read()`, so it resolves only as far as the receiver's type can be read
+/// off the body; one whose type nothing states stays unresolved rather than
+/// becoming a guess.
 #[derive(Clone, Serialize, Deserialize)]
 struct Call {
     /// The final segment — what resolution against local items matches on.
     name: String,
     /// The path as written, when the call site wrote one.
     path: Option<String>,
-    /// A method call's receiver, when it is a bare name — `txn` in
-    /// `txn.remove(…)`, `self` in `self.close()`. A local whose type the
-    /// body declared is the one thing that makes such a call resolvable.
+    /// A method call's receiver as a chain — see [`chain_of`]: `txn` in
+    /// `txn.remove(…)`, `self.graph` in `self.graph.len()`, `v.iter()` in
+    /// `v.iter().map(…)`. Typing the chain is what makes the call resolvable.
     recv: Option<String>,
     /// The call site's line. Not part of identity: the same callee named
     /// twice in one body is one fact, and the first site is the line —
@@ -230,23 +235,16 @@ impl Ord for Call {
 
 /// How a local's type is known without being a compiler.
 ///
-/// Only the two deterministic sources are kept: an annotation is the type
-/// written down, and a plain-call initializer names a function whose declared
-/// return type is on record. Anything else — field access, method chains,
-/// generics — is a checker's job and stays out.
+/// Two deterministic sources: an annotation is the type written down, and an
+/// initializer is a chain the same typing that reads receivers can follow —
+/// `f()` to a declared return, `Vec::new()` to a constructor's type,
+/// `y.m()` through `y`'s type to what `m` returns. Every hop reads something
+/// the source wrote, or a fact about std this parser carries; a hop it
+/// cannot read types nothing, and the local stays untyped.
 #[derive(Clone, Serialize, Deserialize)]
 enum LocalHint {
-    /// `let x = f(…);` — x's type is whatever `f` declares it returns.
-    /// `unwrapped` records a `?`/`.unwrap()`/`.expect(…)` at the site, which
-    /// is what licenses peeling a `Result<T>`/`Option<T>` return to its `T`.
-    Returns { callee: String, unwrapped: bool },
-    /// `let x = y.m(…);` — typing x means typing `y` first, then reading
-    /// what `m` on y's type declares it returns.
-    MethodReturns {
-        recv: String,
-        method: String,
-        unwrapped: bool,
-    },
+    /// `let x = <chain>;` — the initializer as [`chain_of`] renders it.
+    Init(String),
     /// `let x: T = …;` — the annotation, as written.
     Typed(String),
 }
@@ -257,8 +255,9 @@ enum RetShape {
     /// `-> T` for a plain path type.
     Plain(String),
     /// `-> Result<T, …>` / `-> Option<T>` — the `T`, reachable only through
-    /// an unwrapping call site.
-    Wrapped(String),
+    /// an unwrapping call site; and the wrapper's own name, which is what an
+    /// un-peeled return is.
+    Wrapped { wrapper: String, inner: String },
 }
 
 fn parse_file(path: &str, module: &str, text: &str, include_source: bool) -> FileFacts {
@@ -449,9 +448,10 @@ fn walk_items(items: &[syn::Item], parent: &str, include_source: bool, f: &mut F
                 for (idx, args) in closure_sig(&func.sig) {
                     f.closure_sigs.push((key.clone(), idx, args));
                 }
-                for (ident, hint) in local_hints(&func.block)
+                let generics = generic_names(&func.sig.generics, None);
+                for (ident, hint) in local_hints(&func.block, &generics)
                     .into_iter()
-                    .chain(param_hints(&func.sig))
+                    .chain(param_hints(&func.sig, &generics))
                 {
                     f.local_hints.push((key.clone(), ident, hint));
                 }
@@ -685,6 +685,7 @@ fn walk_impl(im: &syn::ItemImpl, parent: &str, include_source: bool, f: &mut Fil
                 }
                 Some({
                     let body = call_names(&m.block);
+                    let generics = generic_names(&m.sig.generics, Some(&im.generics));
                     ImplMethod {
                         name: m.sig.ident.to_string(),
                         label: label.to_string(),
@@ -695,9 +696,9 @@ fn walk_impl(im: &syn::ItemImpl, parent: &str, include_source: bool, f: &mut Fil
                         closures: body.closures,
                         closure_sigs: closure_sig(&m.sig),
                         ret: ret_shape(&m.sig),
-                        locals: local_hints(&m.block)
+                        locals: local_hints(&m.block, &generics)
                             .into_iter()
-                            .chain(param_hints(&m.sig))
+                            .chain(param_hints(&m.sig, &generics))
                             .collect(),
                         line: line_of(&m.sig.ident),
                     }
@@ -882,20 +883,48 @@ fn bare_fn_arg(e: &syn::Expr) -> Option<String> {
     }
 }
 
-/// A method receiver as a dotted name path — `txn`, `o.inner`,
-/// `self.graph` — or nothing when the receiver is any other expression.
-fn recv_path(e: &syn::Expr) -> Option<String> {
+/// An expression as a chain of hops typing can follow, or nothing when it
+/// starts from something typing cannot read.
+///
+/// One string, `.`-separated, because it crosses the phase boundary as a
+/// partial and is compared for call identity: a head, then hops.
+///
+/// - head: a local or `self`; `path::f()` for a call written as a path;
+///   `#str`, `#String`, `#Vec` for a string literal, `format!` and `vec!`,
+///   the three literal shapes whose type is fixed by the language.
+/// - hop: `field`, `m()` (arguments dropped — they never change the type),
+///   or `?`. `&x`, `(x)` and `*x` are looked through, as method resolution
+///   looks through them.
+///
+/// `v[0].m()`, `x.await.m()`, a closure, a block: no chain. Their types are
+/// a checker's to know, and a chain that stops short types nothing.
+fn chain_of(e: &syn::Expr) -> Option<String> {
     match e {
         syn::Expr::Path(p) if p.qself.is_none() && p.path.segments.len() == 1 => {
             Some(p.path.segments[0].ident.to_string())
         }
         syn::Expr::Field(f) => {
-            let base = recv_path(&f.base)?;
+            let base = chain_of(&f.base)?;
             match &f.member {
                 syn::Member::Named(id) => Some(format!("{base}.{id}")),
                 syn::Member::Unnamed(_) => None,
             }
         }
+        syn::Expr::MethodCall(m) => Some(format!("{}.{}()", chain_of(&m.receiver)?, m.method)),
+        syn::Expr::Call(c) => match &*c.func {
+            syn::Expr::Path(p) if p.qself.is_none() => Some(format!("{}()", path_of(&p.path))),
+            _ => None,
+        },
+        syn::Expr::Try(t) => Some(format!("{}.?", chain_of(&t.expr)?)),
+        syn::Expr::Reference(r) => chain_of(&r.expr),
+        syn::Expr::Paren(p) => chain_of(&p.expr),
+        syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => chain_of(&u.expr),
+        syn::Expr::Lit(l) if matches!(l.lit, syn::Lit::Str(_)) => Some("#str".into()),
+        syn::Expr::Macro(m) => match m.mac.path.get_ident().map(ToString::to_string).as_deref() {
+            Some("format") => Some("#String".into()),
+            Some("vec") => Some("#Vec".into()),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -908,7 +937,7 @@ fn recv_path(e: &syn::Expr) -> Option<String> {
 enum ClosureCallee {
     /// `on_all(|p| …)` / `path::to(|p| …)` — the path as written.
     Path(String),
-    /// `x.on_all(|p| …)` — a method call; recv as [`recv_path`] gives it.
+    /// `x.on_all(|p| …)` — a method call; recv as [`chain_of`] gives it.
     Method { recv: Option<String>, name: String },
 }
 
@@ -957,7 +986,7 @@ fn call_names(block: &syn::Block) -> BodyFacts {
             self.0.calls.insert(Call {
                 name: node.method.to_string(),
                 path: None,
-                recv: recv_path(&node.receiver),
+                recv: chain_of(&node.receiver),
                 line: line_of(node),
             });
             for (i, arg) in node.args.iter().enumerate() {
@@ -967,7 +996,7 @@ fn call_names(block: &syn::Block) -> BodyFacts {
                 if let Some(params) = closure_params(arg) {
                     self.0.closures.push((
                         ClosureCallee::Method {
-                            recv: recv_path(&node.receiver),
+                            recv: chain_of(&node.receiver),
                             name: node.method.to_string(),
                         },
                         i,
@@ -992,14 +1021,17 @@ fn call_names(block: &syn::Block) -> BodyFacts {
 /// The locals whose type this body states outright.
 ///
 /// First binding wins on a name bound twice: the calls it might type were
-/// themselves deduplicated to their first site.
-fn local_hints(block: &syn::Block) -> Vec<(String, LocalHint)> {
-    struct Hints<'a>(&'a mut Vec<(String, LocalHint)>);
+/// themselves deduplicated to their first site. `generics` are the names
+/// that are type parameters here — an annotation `x: T` states no type at
+/// all, and typing it as one would resolve `x.m()` to a `T::m` that does not
+/// exist.
+fn local_hints(block: &syn::Block, generics: &BTreeSet<String>) -> Vec<(String, LocalHint)> {
+    struct Hints<'a>(&'a mut Vec<(String, LocalHint)>, &'a BTreeSet<String>);
     impl<'ast> Visit<'ast> for Hints<'_> {
         fn visit_local(&mut self, node: &'ast syn::Local) {
             let hinted = match &node.pat {
                 syn::Pat::Type(t) => match (&*t.pat, plain_type_path(&t.ty)) {
-                    (syn::Pat::Ident(i), Some(ty)) => {
+                    (syn::Pat::Ident(i), Some(ty)) if !self.1.contains(&ty) => {
                         Some((i.ident.to_string(), LocalHint::Typed(ty)))
                     }
                     _ => None,
@@ -1007,8 +1039,8 @@ fn local_hints(block: &syn::Block) -> Vec<(String, LocalHint)> {
                 syn::Pat::Ident(i) => node
                     .init
                     .as_ref()
-                    .and_then(|init| init_hint(&init.expr, false))
-                    .map(|hint| (i.ident.to_string(), hint)),
+                    .and_then(|init| chain_of(&init.expr))
+                    .map(|chain| (i.ident.to_string(), LocalHint::Init(chain))),
                 _ => None,
             };
             if let Some((ident, hint)) = hinted
@@ -1020,52 +1052,36 @@ fn local_hints(block: &syn::Block) -> Vec<(String, LocalHint)> {
         }
     }
     let mut out = Vec::new();
-    Hints(&mut out).visit_block(block);
+    Hints(&mut out, generics).visit_block(block);
     out
 }
 
-/// What an initializer expression says about the type of the local it binds.
-///
-/// Only calls whose target is written down count: a plain call names a
-/// function whose declared return is on record, a method call defers to the
-/// receiver's type. `?`, `.unwrap()` and `.expect(…)` are looked through and
-/// remembered — they are what licenses peeling a wrapped return.
-fn init_hint(e: &syn::Expr, unwrapped: bool) -> Option<LocalHint> {
-    match e {
-        syn::Expr::Try(t) => init_hint(&t.expr, true),
-        syn::Expr::MethodCall(m) if m.method == "unwrap" || m.method == "expect" => {
-            init_hint(&m.receiver, true)
-        }
-        syn::Expr::Call(c) => match &*c.func {
-            syn::Expr::Path(p) => Some(LocalHint::Returns {
-                callee: path_of(&p.path),
-                unwrapped,
-            }),
+/// The names that are type parameters in a signature — its own, and its
+/// impl block's when it has one. Written as a type, such a name states
+/// nothing about what the value is.
+fn generic_names(sig: &syn::Generics, outer: Option<&syn::Generics>) -> BTreeSet<String> {
+    sig.params
+        .iter()
+        .chain(outer.into_iter().flat_map(|g| g.params.iter()))
+        .filter_map(|gp| match gp {
+            syn::GenericParam::Type(t) => Some(t.ident.to_string()),
             _ => None,
-        },
-        syn::Expr::MethodCall(m) => match &*m.receiver {
-            syn::Expr::Path(p) if p.qself.is_none() && p.path.segments.len() == 1 => {
-                Some(LocalHint::MethodReturns {
-                    recv: p.path.segments[0].ident.to_string(),
-                    method: m.method.to_string(),
-                    unwrapped,
-                })
-            }
-            _ => None,
-        },
-        _ => None,
-    }
+        })
+        .collect()
 }
 
 /// A signature's parameters as type-known locals: the annotation is written
 /// in the signature, which is as declared as typing gets. Body bindings are
-/// consumed first, so a shadowing `let` beats its parameter.
-fn param_hints(sig: &syn::Signature) -> Vec<(String, LocalHint)> {
+/// consumed first, so a shadowing `let` beats its parameter. A parameter
+/// typed by a generic (`x: T`) states nothing — see [`local_hints`].
+fn param_hints(sig: &syn::Signature, generics: &BTreeSet<String>) -> Vec<(String, LocalHint)> {
     sig.inputs
         .iter()
         .filter_map(|arg| match arg {
             syn::FnArg::Typed(t) => match (&*t.pat, plain_type_path(&t.ty)) {
-                (syn::Pat::Ident(i), Some(ty)) => Some((i.ident.to_string(), LocalHint::Typed(ty))),
+                (syn::Pat::Ident(i), Some(ty)) if !generics.contains(&ty) => {
+                    Some((i.ident.to_string(), LocalHint::Typed(ty)))
+                }
                 _ => None,
             },
             syn::FnArg::Receiver(_) => None,
@@ -1073,26 +1089,39 @@ fn param_hints(sig: &syn::Signature) -> Vec<(String, LocalHint)> {
         .collect()
 }
 
-/// A type that *is* a path — `Txn`, `db::Txn`, `&mut Txn<'a>` — or nothing.
+/// The type a written type's methods belong to — `Txn`, `db::Txn`,
+/// `&mut Txn<'a>`, and `Vec` for `Vec<Txn>` — or nothing.
 ///
-/// Lifetime arguments are dropped: they never change which type it is. Type
-/// arguments disqualify — `Option<Txn>` is an `Option`, and its methods are
-/// std's, not `Txn`'s. References are looked through, as method resolution
-/// does.
+/// Arguments are dropped: `Option<Txn>` is an `Option`, and its methods are
+/// std's, not `Txn`'s, so the base path is what a method call on it needs.
+/// References are looked through, as method resolution does; so are `Box`,
+/// `Arc`, `Rc` and `Cow`, whose methods are the pointee's by deref — for
+/// those the pointee is the answer, and a pointee that is not a path (`Box<dyn
+/// Tr>`) is no answer at all. A slice or array is the primitive std documents
+/// it as. `Fn(…)` sugar, tuples and `impl`/`dyn` types are not paths, and
+/// yield nothing.
 fn plain_type_path(ty: &syn::Type) -> Option<String> {
-    fn lifetimes_only(seg: &syn::PathSegment) -> bool {
-        match &seg.arguments {
-            syn::PathArguments::None => true,
-            syn::PathArguments::AngleBracketed(a) => a
-                .args
-                .iter()
-                .all(|g| matches!(g, syn::GenericArgument::Lifetime(_))),
-            syn::PathArguments::Parenthesized(_) => false,
-        }
-    }
+    const DEREF_TO_ARG: &[&str] = &["Box", "Arc", "Rc", "Cow"];
     match ty {
         syn::Type::Reference(r) => plain_type_path(&r.elem),
-        syn::Type::Path(p) if p.qself.is_none() && p.path.segments.iter().all(lifetimes_only) => {
+        syn::Type::Paren(p) => plain_type_path(&p.elem),
+        // The primitives std documents under those names: `slice::len`.
+        syn::Type::Slice(_) => Some("slice".into()),
+        syn::Type::Array(_) => Some("array".into()),
+        syn::Type::Path(p) if p.qself.is_none() => {
+            let last = p.path.segments.last()?;
+            if let syn::PathArguments::Parenthesized(_) = last.arguments {
+                return None;
+            }
+            if DEREF_TO_ARG.contains(&last.ident.to_string().as_str())
+                && let syn::PathArguments::AngleBracketed(a) = &last.arguments
+            {
+                let inner = a.args.iter().find_map(|g| match g {
+                    syn::GenericArgument::Type(t) => Some(t),
+                    _ => None,
+                })?;
+                return plain_type_path(inner);
+            }
             Some(
                 p.path
                     .segments
@@ -1271,18 +1300,19 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
         for (key, ret) in &f.returns {
             let expanded = match ret {
                 RetShape::Plain(t) => RetShape::Plain(expand_path(t, &imports, &f.module)),
-                RetShape::Wrapped(t) => RetShape::Wrapped(expand_path(t, &imports, &f.module)),
+                RetShape::Wrapped { wrapper, inner } => RetShape::Wrapped {
+                    wrapper: wrapper.clone(),
+                    inner: expand_path(inner, &imports, &f.module),
+                },
             };
             returns_map.insert(key.clone(), expanded);
         }
         for (caller, ident, hint) in &f.local_hints {
             let expanded = match hint {
-                LocalHint::Returns { callee, unwrapped } => LocalHint::Returns {
-                    callee: expand_path(callee, &imports, &f.module),
-                    unwrapped: *unwrapped,
-                },
+                LocalHint::Init(chain) => {
+                    LocalHint::Init(expand_chain(chain, |p| expand_path(p, &imports, &f.module)))
+                }
                 LocalHint::Typed(t) => LocalHint::Typed(expand_path(t, &imports, &f.module)),
-                chained @ LocalHint::MethodReturns { .. } => chained.clone(),
             };
             local_inits
                 .entry((caller.clone(), ident.clone()))
@@ -1501,7 +1531,10 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
                     };
                     let expanded = match ret {
                         RetShape::Plain(t) => RetShape::Plain(self_or(t)),
-                        RetShape::Wrapped(t) => RetShape::Wrapped(self_or(t)),
+                        RetShape::Wrapped { wrapper, inner } => RetShape::Wrapped {
+                            wrapper: wrapper.clone(),
+                            inner: self_or(inner),
+                        },
                     };
                     returns_map.insert(mkey.clone(), expanded);
                 }
@@ -1509,11 +1542,7 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
                     let expanded = match hint {
                         LocalHint::Typed(t) if t == "Self" => LocalHint::Typed(self_key.clone()),
                         LocalHint::Typed(t) => LocalHint::Typed(deself(t)),
-                        LocalHint::Returns { callee, unwrapped } => LocalHint::Returns {
-                            callee: deself(callee),
-                            unwrapped: *unwrapped,
-                        },
-                        chained @ LocalHint::MethodReturns { .. } => chained.clone(),
+                        LocalHint::Init(chain) => LocalHint::Init(expand_chain(chain, deself)),
                     };
                     local_inits
                         .entry((mkey.clone(), ident.clone()))
@@ -1672,14 +1701,15 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
                             .cloned()
                     }
                 }
-                ClosureCallee::Method { recv, name } => {
-                    let ty = match recv.as_deref() {
-                        Some("self") => owner_of(caller),
-                        Some(r) => typing.local_type(caller, r, 6),
-                        None => None,
-                    };
-                    ty.and_then(|t| typing.method_target(&t, name).map(|(k, _)| k))
-                }
+                ClosureCallee::Method { recv, name } => recv
+                    .as_deref()
+                    .and_then(|r| typing.chain_type(caller, r, 6))
+                    .and_then(|ty| match ty {
+                        Ty::Declared(t) => typing.method_target(&t, name).map(|(k, _)| k),
+                        // A closure handed to std declares nothing this
+                        // parser can read a bound from.
+                        Ty::External(_) => None,
+                    }),
             };
             let Some(fn_key) = fn_key else { continue };
             let Some(args) = closure_sig_map.get(&(fn_key.clone(), *idx)) else {
@@ -1710,23 +1740,36 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
         impls_of: &impls_of,
         trait_impl_methods: &trait_impl_methods,
     };
-    let typed_target = |caller: &str, call: &Call| -> Option<(String, &'static str)> {
-        let recv = call.recv.as_deref()?;
-        // A dotted receiver walks declared field types: `o.inner.ping()`
-        // types `o`, then reads what `inner` is stated to be.
-        let mut segments = recv.split('.');
-        let head = segments.next()?;
-        let mut ty = if head == "self" {
-            owner_of(caller)?
-        } else {
-            typing.local_type(caller, head, 8)?
+    // What a method call lands on, from its receiver's type: a declared
+    // type's own method, or — when the type is std's or a dependency's — an
+    // external stand-in keyed `Type::method`, the one thing known about it.
+    let typed_target =
+        |caller: &str, call: &Call| -> Option<(String, &'static str, &'static str)> {
+            let recv = call.recv.as_deref()?;
+            let name = call.name.as_str();
+            let short = |ty: &str| ty.rsplit("::").next().unwrap_or(ty).to_string();
+            match typing.chain_type(caller, recv, 8)? {
+                Ty::Declared(ty) => {
+                    if let Some((mk, how)) = typing.method_target(&ty, name) {
+                        return Some((mk, if recv == "self" { "self" } else { how }, "high"));
+                    }
+                    // No such method declared: a std trait's, when the name is
+                    // one — `#[derive(Clone)]` writes no `fn clone` anywhere.
+                    // Medium, because the impl is inferred from the name, not
+                    // read.
+                    let (tr, _) = std_trait(name)?;
+                    Some((format!("{tr}::{name}"), "std-trait", "medium"))
+                }
+                Ty::External(ty) => {
+                    if std_inherent(&short(&ty), name).is_none()
+                        && let Some((tr, _)) = std_trait(name)
+                    {
+                        return Some((format!("{tr}::{name}"), "std-trait", "medium"));
+                    }
+                    Some((format!("{ty}::{name}"), "external-receiver", "high"))
+                }
+            }
         };
-        for field in segments {
-            ty = typing.field_type(&ty, field)?;
-        }
-        let (mk, how) = typing.method_target(&ty, &call.name)?;
-        Some((mk, if recv == "self" { "self" } else { how }))
-    };
 
     for (caller, file, call) in pending {
         let written = call.path.clone().unwrap_or_else(|| call.name.clone());
@@ -1807,10 +1850,16 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
         }
 
         // A method call writes only `.read()`. When the body states the
-        // receiver's type it resolves; otherwise it is counted, never
-        // guessed — but shown, as an UnresolvedRef the graph can answer for.
-        if let Some((target, strategy)) = typed_target(&caller, &call) {
-            emit(&mut out, &mut emitted, &target, strategy, "high");
+        // receiver's type it resolves — into std and other crates too, as an
+        // external node that is the path and the fact it was called;
+        // otherwise it is counted, never guessed — but shown, as an
+        // UnresolvedRef the graph can answer for.
+        if let Some((target, strategy, band)) = typed_target(&caller, &call) {
+            if matches!(strategy, "external-receiver" | "std-trait") {
+                note_external(&mut external, &target, Some("Method"));
+                external_calls += 1;
+            }
+            emit(&mut out, &mut emitted, &target, strategy, band);
             continue;
         }
         unresolved += 1;
@@ -1884,7 +1933,7 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
     if unresolved > 0 {
         out.notes.push(format!(
             "{unresolved} method call(s) left unresolved: a call written `.read()` \
-             names no path, and the receiver's type is what a parser cannot know"
+             names no path, and nothing in the body states the receiver's type"
         ));
     }
     if external_calls > 0 {
@@ -2142,6 +2191,331 @@ struct Typing<'a> {
     trait_impl_methods: &'a BTreeMap<(String, String), String>,
 }
 
+/// A receiver's type, as far as this parser can know it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Ty {
+    /// A type this tree declares — its methods are declared keys.
+    Declared(String),
+    /// A type it does not — std's, a dependency's — known by its path alone.
+    /// Its methods are external stand-ins, `path::method`.
+    External(String),
+}
+
+/// What a std method hands back, relative to its receiver.
+enum StdRet {
+    /// The receiver's own type — `clone`, `to_owned`, `max`.
+    Same,
+    /// A named type, spelled as the prelude spells it.
+    Of(&'static str),
+    /// The method is std's, but what it returns depends on a type argument
+    /// this parser does not track — `Option::unwrap`, `Iterator::collect`.
+    Unknown,
+}
+
+/// The inherent methods of the std types a body most often holds, with what
+/// each returns: the facts that let a chain go on past a hop into std, and
+/// that make `Option::map` the target of `.map()` on an `Option` rather
+/// than a guess. Keyed by the type's short name; `Iterator` stands for every
+/// iterator, since the concrete adapter types are std's business and never
+/// spelled by the source.
+///
+/// Every entry is a fact about the standard library. A method missing here
+/// resolves to `Type::method` all the same — the type is known — but the
+/// chain stops there, because the return is not.
+fn std_inherent(ty: &str, method: &str) -> Option<StdRet> {
+    use StdRet::{Of, Same, Unknown};
+    Some(match (ty, method) {
+        (_, "iter" | "iter_mut" | "into_iter" | "drain") if ty != "Iterator" => Of("Iterator"),
+        ("Iterator", m) => match m {
+            "map" | "filter" | "filter_map" | "enumerate" | "zip" | "take" | "skip" | "chain"
+            | "flat_map" | "flatten" | "rev" | "cloned" | "copied" | "peekable" | "take_while"
+            | "skip_while" | "inspect" | "step_by" | "fuse" | "scan" | "map_while" | "by_ref"
+            | "sorted" => Same,
+            "next" | "last" | "nth" | "find" | "find_map" | "position" | "max" | "min"
+            | "max_by_key" | "min_by_key" | "max_by" | "min_by" | "reduce" => Of("Option"),
+            "count" => Of("usize"),
+            "any" | "all" => Of("bool"),
+            "collect" | "sum" | "product" | "fold" | "unzip" | "partition" | "for_each"
+            | "try_for_each" | "try_fold" => Unknown,
+            _ => return None,
+        },
+        ("Option", m) => match m {
+            "map" | "filter" | "take" | "replace" | "as_ref" | "as_mut" | "as_deref"
+            | "as_deref_mut" | "cloned" | "copied" | "and_then" | "or" | "or_else" | "xor"
+            | "zip" | "flatten" | "inspect" | "get_or_insert_with" => Same,
+            "ok_or" | "ok_or_else" | "transpose" => Of("Result"),
+            "is_some" | "is_none" | "is_some_and" | "is_none_or" => Of("bool"),
+            "unwrap" | "expect" | "unwrap_or" | "unwrap_or_else" | "unwrap_or_default"
+            | "map_or" | "map_or_else" | "unwrap_unchecked" => Unknown,
+            _ => return None,
+        },
+        ("Result", m) => match m {
+            "map" | "map_err" | "and_then" | "or_else" | "as_ref" | "as_mut" | "as_deref"
+            | "inspect" | "inspect_err" | "context" | "with_context" => Same,
+            "ok" | "err" => Of("Option"),
+            "is_ok" | "is_err" | "is_ok_and" | "is_err_and" => Of("bool"),
+            "unwrap" | "expect" | "unwrap_or" | "unwrap_or_else" | "unwrap_or_default"
+            | "unwrap_err" | "expect_err" | "map_or" | "map_or_else" => Unknown,
+            _ => return None,
+        },
+        ("Vec" | "VecDeque" | "slice" | "array", m) => match m {
+            "windows" | "chunks" | "chunks_exact" | "rchunks" | "split" | "splitn" => {
+                Of("Iterator")
+            }
+            "first" | "last" | "get" | "get_mut" | "first_mut" | "last_mut" | "pop"
+            | "pop_front" | "pop_back" | "front" | "back" => Of("Option"),
+            "binary_search" | "binary_search_by" | "binary_search_by_key" => Of("Result"),
+            "len" | "capacity" => Of("usize"),
+            "is_empty" | "contains" | "starts_with" | "ends_with" | "is_sorted" => Of("bool"),
+            "join" | "concat" if ty != "VecDeque" => Of("String"),
+            "to_vec" | "split_off" => Of("Vec"),
+            "as_slice" | "as_mut_slice" => Of("slice"),
+            "push"
+            | "push_back"
+            | "push_front"
+            | "insert"
+            | "remove"
+            | "swap_remove"
+            | "sort"
+            | "sort_by"
+            | "sort_by_key"
+            | "sort_unstable"
+            | "sort_unstable_by"
+            | "sort_unstable_by_key"
+            | "dedup"
+            | "dedup_by_key"
+            | "reverse"
+            | "clear"
+            | "truncate"
+            | "extend"
+            | "extend_from_slice"
+            | "retain"
+            | "resize"
+            | "reserve"
+            | "shrink_to_fit"
+            | "fill"
+            | "swap"
+            | "copy_from_slice"
+            | "clone_from_slice"
+            | "rotate_left"
+            | "rotate_right"
+            | "append" => Unknown,
+            _ => return None,
+        },
+        ("HashMap" | "BTreeMap", m) => match m {
+            "get" | "get_mut" | "remove" | "insert" | "get_key_value" | "remove_entry"
+            | "first_key_value" | "last_key_value" | "pop_first" | "pop_last" => Of("Option"),
+            "keys" | "values" | "values_mut" | "into_keys" | "into_values" | "range"
+            | "range_mut" => Of("Iterator"),
+            "len" => Of("usize"),
+            "contains_key" | "is_empty" => Of("bool"),
+            "entry" | "clear" | "extend" | "retain" | "reserve" | "append" | "split_off" => Unknown,
+            _ => return None,
+        },
+        ("HashSet" | "BTreeSet", m) => match m {
+            "union" | "intersection" | "difference" | "symmetric_difference" | "range" => {
+                Of("Iterator")
+            }
+            "insert" | "remove" | "contains" | "is_empty" | "is_subset" | "is_superset"
+            | "is_disjoint" => Of("bool"),
+            "len" => Of("usize"),
+            "get" | "take" | "first" | "last" | "pop_first" | "pop_last" => Of("Option"),
+            "clear" | "extend" | "retain" | "reserve" | "append" | "split_off" => Unknown,
+            _ => return None,
+        },
+        ("str" | "String", m) => match m {
+            "trim" | "trim_start" | "trim_end" | "trim_matches" | "trim_start_matches"
+            | "trim_end_matches" | "as_str" => Of("str"),
+            "to_lowercase" | "to_uppercase" | "to_ascii_lowercase" | "to_ascii_uppercase"
+            | "replace" | "replacen" | "repeat" => Of("String"),
+            "chars"
+            | "bytes"
+            | "lines"
+            | "split"
+            | "rsplit"
+            | "splitn"
+            | "rsplitn"
+            | "split_whitespace"
+            | "split_ascii_whitespace"
+            | "split_terminator"
+            | "char_indices"
+            | "matches"
+            | "match_indices"
+            | "split_inclusive"
+            | "encode_utf16" => Of("Iterator"),
+            "find" | "rfind" | "strip_prefix" | "strip_suffix" | "split_once" | "rsplit_once"
+            | "get" | "pop" => Of("Option"),
+            "parse" | "from_utf8" => Of("Result"),
+            "len" | "capacity" => Of("usize"),
+            "is_empty"
+            | "contains"
+            | "starts_with"
+            | "ends_with"
+            | "eq_ignore_ascii_case"
+            | "is_char_boundary"
+            | "is_ascii" => Of("bool"),
+            "as_bytes" => Of("slice"),
+            "into_bytes" | "into_boxed_str" => Of("Vec"),
+            "push"
+            | "push_str"
+            | "clear"
+            | "truncate"
+            | "insert"
+            | "insert_str"
+            | "extend"
+            | "retain"
+            | "reserve"
+            | "remove"
+            | "drain"
+            | "make_ascii_lowercase"
+            | "make_ascii_uppercase" => Unknown,
+            _ => return None,
+        },
+        ("Mutex", "lock" | "try_lock")
+        | ("RwLock", "read" | "write" | "try_read" | "try_write") => Of("Result"),
+        ("RefCell", "borrow" | "borrow_mut" | "try_borrow" | "try_borrow_mut")
+        | ("Cell", "get" | "set" | "take" | "replace")
+        | ("OnceLock" | "OnceCell" | "LazyLock", "get" | "set" | "get_or_init" | "force") => {
+            Unknown
+        }
+        ("Path" | "PathBuf", m) => match m {
+            "join" | "with_extension" | "with_file_name" | "to_path_buf" => {
+                Of("std::path::PathBuf")
+            }
+            "parent" | "file_name" | "extension" | "file_stem" | "to_str" => Of("Option"),
+            "exists" | "is_file" | "is_dir" | "is_absolute" | "is_relative" | "starts_with"
+            | "ends_with" | "has_root" | "is_symlink" => Of("bool"),
+            "components" | "ancestors" | "iter" => Of("Iterator"),
+            "as_path" => Of("std::path::Path"),
+            "strip_prefix" | "canonicalize" | "metadata" | "read_dir" => Of("Result"),
+            "display" | "as_os_str" | "to_string_lossy" | "push" | "pop" | "set_extension"
+            | "set_file_name" => Unknown,
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// What a call written as a path into std or a well-known crate returns,
+/// by the owner's short name and the function's: `fs::read(…)` is a
+/// `Result`, `String::from_utf8(…)` is a `Result`, and by the conventions
+/// every type honours, `T::try_from(…)`/`T::from_str(…)` are too. The
+/// receiver of the `.unwrap()`, `?` or `.map_err(…)` that follows is then
+/// known — the single most common shape left in the ledger otherwise.
+fn std_path_return(owner: &str, function: &str) -> Option<StdRet> {
+    use StdRet::Of;
+    Some(match (owner, function) {
+        (_, "try_from" | "from_str") => Of("Result"),
+        (
+            "fs",
+            "read" | "read_to_string" | "write" | "create_dir" | "create_dir_all" | "remove_file"
+            | "remove_dir" | "remove_dir_all" | "metadata" | "symlink_metadata" | "read_dir"
+            | "canonicalize" | "rename" | "copy" | "read_link" | "hard_link",
+        ) => Of("Result"),
+        ("File", "open" | "create" | "create_new") => Of("Result"),
+        ("env", "var" | "current_dir" | "current_exe") => Of("Result"),
+        ("env", "var_os") => Of("Option"),
+        ("str" | "String", "from_utf8") => Of("Result"),
+        (
+            "serde_json" | "serde_yaml" | "toml" | "rmp_serde" | "postcard" | "bincode",
+            "to_string" | "to_string_pretty" | "to_vec" | "to_vec_pretty" | "to_writer"
+            | "to_value" | "from_slice" | "from_reader" | "from_value",
+        ) => Of("Result"),
+        _ => return None,
+    })
+}
+
+/// Methods every type answers through a std trait — by `derive`, by a
+/// blanket impl, or by hand — so a call on a typed receiver that declares no
+/// such method is that trait's: `x.clone()` on a `#[derive(Clone)]` struct
+/// is `Clone::clone`. Named after the trait, because that is where the
+/// method is declared and one node is what "who calls `Clone::clone`" wants.
+/// `fmt` is left out: `Debug::fmt` and `Display::fmt` share the name, and a
+/// call site does not say which.
+fn std_trait(method: &str) -> Option<(&'static str, StdRet)> {
+    use StdRet::{Of, Same, Unknown};
+    Some(match method {
+        "clone" | "clone_from" => ("Clone", Same),
+        "to_owned" => ("ToOwned", Unknown),
+        "to_string" => ("ToString", Of("String")),
+        "into" => ("Into", Unknown),
+        "try_into" => ("TryInto", Of("Result")),
+        "as_ref" => ("AsRef", Unknown),
+        "as_mut" => ("AsMut", Unknown),
+        "borrow" => ("Borrow", Unknown),
+        "borrow_mut" => ("BorrowMut", Unknown),
+        "eq" | "ne" => ("PartialEq", Of("bool")),
+        "lt" | "le" | "gt" | "ge" => ("PartialOrd", Of("bool")),
+        "partial_cmp" => ("PartialOrd", Of("Option")),
+        "cmp" => ("Ord", Unknown),
+        "max" | "min" | "clamp" => ("Ord", Same),
+        "hash" => ("Hash", Unknown),
+        _ => return None,
+    })
+}
+
+/// What a std method returns on `recv`: its inherent table first, then the
+/// blanket traits — `to_owned` on a `str` is `String` by the first, `clone`
+/// on anything is itself by the second.
+fn std_return(recv: &Ty, method: &str) -> Option<Ty> {
+    let name = match recv {
+        Ty::Declared(k) | Ty::External(k) => k.rsplit("::").next().unwrap_or(k),
+    };
+    let ret = match (recv, std_inherent(name, method)) {
+        // A declared type's methods are its own; only what std adds to
+        // *every* type — the blanket traits — applies to it.
+        (Ty::External(_), Some(ret)) => ret,
+        (_, _) if name == "str" && method == "to_owned" => StdRet::Of("String"),
+        _ => std_trait(method)?.1,
+    };
+    match ret {
+        StdRet::Same => Some(recv.clone()),
+        StdRet::Of(t) => Some(Ty::External(t.to_string())),
+        StdRet::Unknown => None,
+    }
+}
+
+/// A written type that is nobody's declaration, as an external type — or
+/// nothing, when the name could not be a type at all.
+///
+/// A primitive is one; so is any path whose last segment is capitalised the
+/// way a type is. `Self` is not: it names this impl's type, resolved where the
+/// impl is known. A lone capital (`T`, `E1`) is a generic parameter by every
+/// convention, and a generic states no type — the signature's own parameters
+/// are already filtered by name, and this catches the ones declared further
+/// out.
+fn external_type(written: &str) -> Option<String> {
+    const PRIMITIVES: &[&str] = &[
+        "str", "bool", "char", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32",
+        "i64", "i128", "isize", "f32", "f64",
+    ];
+    let last = written.rsplit("::").next()?;
+    if PRIMITIVES.contains(&last) {
+        return Some(written.to_string());
+    }
+    if last == "Self" || !last.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return None;
+    }
+    if last[1..].chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(written.to_string())
+}
+
+/// A chain's path-call hops (`fs::read()`) expanded through the writing
+/// file's imports, the way a call's own path is — every other hop is a name
+/// that means the same everywhere.
+fn expand_chain(chain: &str, expand: impl Fn(&str) -> String) -> String {
+    chain
+        .split('.')
+        .map(|hop| match hop.strip_suffix("()") {
+            Some(p) if p.contains("::") => format!("{}()", expand(p)),
+            _ => hop.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 impl Typing<'_> {
     /// The declared key a written type resolves to, or nothing.
     fn type_key(&self, written: &str, module: &str) -> Option<String> {
@@ -2157,25 +2531,143 @@ impl Typing<'_> {
             .cloned()
     }
 
+    /// A written type as a [`Ty`]: the declaration it resolves to, else the
+    /// external type it names.
+    fn written_type(&self, written: &str, module: &str) -> Option<Ty> {
+        if let Some(key) = self.type_key(written, module) {
+            return Some(Ty::Declared(key));
+        }
+        external_type(written).map(Ty::External)
+    }
+
     /// A callable's declared return, peeled only when the site unwrapped it,
-    /// resolved in the callable's own module.
-    fn returned_type(&self, callable: &str, unwrapped: bool) -> Option<String> {
+    /// resolved in the callable's own module. `Self` is the impl's type.
+    fn returned_type(&self, callable: &str, unwrapped: bool) -> Option<Ty> {
         let written = match (self.returns_map.get(callable)?, unwrapped) {
             (RetShape::Plain(t), false) => t,
-            (RetShape::Wrapped(t), true) => t,
-            // A `Result` nobody unwrapped is a `Result`; an `unwrap()` on a
-            // plain type is std's business — neither types the local.
-            _ => return None,
+            (RetShape::Wrapped { inner, .. }, true) => inner,
+            // A `Result` nobody unwrapped is a `Result`, and its methods are
+            // std's.
+            (RetShape::Wrapped { wrapper, .. }, false) => {
+                return Some(Ty::External(wrapper.clone()));
+            }
+            // An `unwrap()` on a plain type is not this parser's to explain.
+            (RetShape::Plain(_), true) => return None,
         };
+        if written == "Self" {
+            return owner_of(callable).map(Ty::Declared);
+        }
         let module = self.scopes.get(callable).map(String::as_str).unwrap_or("");
-        self.type_key(written, module)
+        self.written_type(written, module)
     }
 
     /// The declared type of a field, resolved — one hop of a dotted
-    /// receiver (`o.inner`).
-    fn field_type(&self, ty: &str, field: &str) -> Option<String> {
+    /// receiver (`o.inner`). A field of an external type is unknown: we do
+    /// not read that code.
+    fn field_type(&self, ty: &Ty, field: &str) -> Option<Ty> {
+        let Ty::Declared(ty) = ty else { return None };
         let (written, module) = self.fields_map.get(&(ty.to_string(), field.to_string()))?;
-        self.type_key(written, module)
+        self.written_type(written, module)
+    }
+
+    /// What a callable named by path returns, the callable resolved from the
+    /// caller's module: a declaration's stated return, or — for a path into
+    /// std or a dependency — the type a constructor by convention returns:
+    /// `Vec::new()`, `String::from(…)`, `HashMap::with_capacity(…)` are that
+    /// type, and nothing else about a foreign function is known.
+    fn call_type(&self, callee: &str, module: &str, unwrapped: bool) -> Option<Ty> {
+        const CONSTRUCTORS: &[&str] = &[
+            "new",
+            "default",
+            "with_capacity",
+            "from",
+            "now",
+            "from_iter",
+        ];
+        let declared = if self.declared.contains(callee) {
+            Some(callee.to_string())
+        } else if callee.contains("::") {
+            resolve_relative(callee, module, self.aliases, self.declared)
+        } else {
+            self.fns
+                .get(callee)
+                .and_then(|cands| pick_in_scope(module, cands, self.scopes))
+                .cloned()
+        };
+        if let Some(fk) = declared {
+            return self.returned_type(&fk, unwrapped);
+        }
+        let (owner, function) = callee.rsplit_once("::")?;
+        if CONSTRUCTORS.contains(&function) {
+            return external_type(owner).map(Ty::External);
+        }
+        let short = owner.rsplit("::").next().unwrap_or(owner);
+        match std_path_return(short, function)? {
+            // Peeled, the payload is a type argument this parser does not
+            // track; un-peeled, it is the wrapper.
+            StdRet::Of(t) if !unwrapped => Some(Ty::External(t.to_string())),
+            _ => None,
+        }
+    }
+
+    /// What a method on `recv` returns: the declared method's stated return
+    /// when the type is declared here and has one, else what std fixes for
+    /// the name. A std return that the site peeled (`m.get(k).unwrap()`) is
+    /// a payload this parser has no type for.
+    fn method_return(&self, recv: &Ty, method: &str, unwrapped: bool) -> Option<Ty> {
+        if let Ty::Declared(k) = recv
+            && let Some((mk, _)) = self.method_target(k, method)
+        {
+            return self.returned_type(&mk, unwrapped);
+        }
+        if unwrapped {
+            return None;
+        }
+        std_return(recv, method)
+    }
+
+    /// The type a chain — see [`chain_of`] — ends on, hop by hop from its
+    /// head. A hop typing cannot read ends the chain with nothing: a partial
+    /// answer would type the wrong receiver.
+    ///
+    /// `?`, `unwrap()` and `expect()` are read one hop ahead of the call
+    /// they peel, which is where the declared `Result<T>`/`Option<T>` says
+    /// what they peel to; standing alone they peel a type this parser does
+    /// not have the inside of.
+    fn chain_type(&self, caller: &str, chain: &str, depth: usize) -> Option<Ty> {
+        const PEELS: &[&str] = &["?", "unwrap()", "expect()"];
+        let module = self.scopes.get(caller).map(String::as_str).unwrap_or("");
+        let mut hops = chain.split('.').peekable();
+        let head = hops.next()?;
+        let peels_next = |hops: &mut std::iter::Peekable<std::str::Split<'_, char>>| {
+            hops.next_if(|h| PEELS.contains(h)).is_some()
+        };
+        let mut ty = if head == "self" {
+            let owner = owner_of(caller)?;
+            if self.declared.contains(&owner) {
+                Ty::Declared(owner)
+            } else {
+                Ty::External(owner)
+            }
+        } else if let Some(literal) = head.strip_prefix('#') {
+            Ty::External(literal.to_string())
+        } else if let Some(callee) = head.strip_suffix("()") {
+            let unwrapped = peels_next(&mut hops);
+            self.call_type(callee, module, unwrapped)?
+        } else {
+            self.local_type(caller, head, depth)?
+        };
+        while let Some(hop) = hops.next() {
+            ty = if let Some(method) = hop.strip_suffix("()") {
+                let unwrapped = peels_next(&mut hops);
+                self.method_return(&ty, method, unwrapped)?
+            } else if PEELS.contains(&hop) {
+                return None;
+            } else {
+                self.field_type(&ty, hop)?
+            };
+        }
+        Some(ty)
     }
 
     /// The method a type answers `name` with: its own inherent method, the
@@ -2201,9 +2693,9 @@ impl Typing<'_> {
         None
     }
 
-    /// The resolved type of a body's local, through its annotation or its
+    /// The type of a body's local, through its annotation or its
     /// initializer, chaining through other locals up to `depth` hops.
-    fn local_type(&self, caller: &str, ident: &str, depth: usize) -> Option<String> {
+    fn local_type(&self, caller: &str, ident: &str, depth: usize) -> Option<Ty> {
         if depth == 0 {
             return None;
         }
@@ -2212,34 +2704,8 @@ impl Typing<'_> {
             .local_inits
             .get(&(caller.to_string(), ident.to_string()))?
         {
-            LocalHint::Typed(t) => self.type_key(t, module),
-            LocalHint::Returns { callee, unwrapped } => {
-                let fk = if self.declared.contains(callee) {
-                    callee.clone()
-                } else if callee.contains("::") {
-                    resolve_relative(callee, module, self.aliases, self.declared)?
-                } else {
-                    self.fns
-                        .get(callee.as_str())
-                        .and_then(|cands| pick_in_scope(module, cands, self.scopes))?
-                        .clone()
-                };
-                self.returned_type(&fk, *unwrapped)
-            }
-            LocalHint::MethodReturns {
-                recv,
-                method,
-                unwrapped,
-            } => {
-                let rty = if recv == "self" {
-                    owner_of(caller)?
-                } else {
-                    self.local_type(caller, recv, depth - 1)?
-                };
-                let mk = format!("{rty}::{method}");
-                self.declared.contains(&mk).then_some(())?;
-                self.returned_type(&mk, *unwrapped)
-            }
+            LocalHint::Typed(t) => self.written_type(t, module),
+            LocalHint::Init(chain) => self.chain_type(caller, chain, depth - 1),
         }
     }
 }
@@ -2815,12 +3281,10 @@ fn ret_shape(sig: &syn::Signature) -> Option<RetShape> {
     let syn::ReturnType::Type(_, ty) = &sig.output else {
         return None;
     };
-    if let Some(plain) = plain_type_path(ty) {
-        return Some(RetShape::Plain(plain));
-    }
     // `Result` / `Option` by last-segment ident: `anyhow::Result<T>` and a
     // crate's own `Result<T>` alias both count — what matters is that `?`
-    // and `.unwrap()` reach the `T`.
+    // and `.unwrap()` reach the `T`. Checked first: as a plain path either
+    // is just its own name, which is what an un-peeled one is.
     if let syn::Type::Path(p) = &**ty
         && p.qself.is_none()
         && let Some(last) = p.path.segments.last()
@@ -2828,9 +3292,12 @@ fn ret_shape(sig: &syn::Signature) -> Option<RetShape> {
         && let syn::PathArguments::AngleBracketed(a) = &last.arguments
         && let Some(syn::GenericArgument::Type(inner)) = a.args.first()
     {
-        return plain_type_path(inner).map(RetShape::Wrapped);
+        return plain_type_path(inner).map(|inner| RetShape::Wrapped {
+            wrapper: last.ident.to_string(),
+            inner,
+        });
     }
-    None
+    plain_type_path(ty).map(RetShape::Plain)
 }
 
 fn path_of(path: &syn::Path) -> String {
