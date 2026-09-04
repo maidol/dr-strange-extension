@@ -1997,33 +1997,42 @@ fn a_method_chain_is_typed_hop_by_hop() {
     every_edge_has_endpoints(&out);
 }
 
-/// A generic parameter states no type: `x: T` types nothing, so `x.m()`
-/// stays in the ledger rather than becoming a `T::m` that exists nowhere.
-/// Likewise a receiver nothing states the type of.
+/// A bounded generic parameter is its bound: `x: T` with `T: Tr`, `y: &impl
+/// Tr` and `b: Box<dyn Tr>` all answer `.m()` with `Tr::m`, since every
+/// method called on such a value is the trait's. An unbounded parameter
+/// states no type, so `u.m()` stays in the ledger rather than becoming a
+/// `U::m` that exists nowhere; likewise a receiver nothing states the type
+/// of.
 #[test]
-fn generic_and_untyped_receivers_stay_in_the_ledger() {
+fn bounded_generics_are_their_trait_and_unbounded_ones_stay_in_the_ledger() {
     let t = Tree::new("ext-generic");
     t.write("Cargo.toml", "[package]\nname = \"k\"\n").write(
         "src/lib.rs",
         concat!(
             "pub trait Tr { fn m(&self); }\n",
-            "pub fn go<T: Tr>(x: T, y: &impl Tr) { x.m(); y.m(); }\n",
+            "pub fn go<T: Tr>(x: T, y: &impl Tr, b: Box<dyn Tr>) { x.m(); y.m(); b.m(); }\n",
+            "pub fn wc<T>(x: T) where T: Tr { x.m(); }\n",
             "pub struct W<U>(U);\n",
             "impl<U> W<U> { pub fn inner(&self, u: U) { u.m(); } }\n",
             "pub fn other() { let z = unknown(); z.m(); }\n",
         ),
     );
     let out = run(&t);
-    let targets: Vec<&str> = out
+    for src in ["k::go", "k::wc"] {
+        assert!(
+            has_edge(&out, src, "CALLS", "k::Tr::m"),
+            "{src}: {:?}",
+            out.edges
+        );
+    }
+    let mut ledger: Vec<&str> = out
         .edges
         .iter()
-        .filter(|e| e.ty == "CALLS" && e.dst.ends_with("::m"))
-        .map(|e| e.dst.as_str())
+        .filter(|e| e.ty == "CALLS" && e.dst.starts_with("?::"))
+        .map(|e| e.src.as_str())
         .collect();
-    assert!(
-        targets.iter().all(|d| d.starts_with("?::")),
-        "a generic receiver is never typed: {targets:?}"
-    );
+    ledger.sort();
+    assert_eq!(ledger, vec!["k::W::inner", "k::other"], "{ledger:?}");
     assert!(
         !out.nodes.iter().any(|n| n.key == "T::m" || n.key == "U::m"),
         "no method node for a type parameter"
@@ -2058,8 +2067,8 @@ fn declared_types_and_methods_beat_the_std_table() {
 }
 
 /// `Box`, `Arc` and `Rc` are looked through to what they point at, as method
-/// resolution does by deref — `Arc<Mutex<T>>` answers `.lock()` as `Mutex`.
-/// A pointee that is not a path is no answer at all.
+/// resolution does by deref — `Arc<Mutex<T>>` answers `.lock()` as `Mutex`,
+/// and `Box<dyn Tr>` as `Tr`.
 #[test]
 fn smart_pointers_type_as_their_pointee() {
     let t = Tree::new("ext-deref");
@@ -2078,8 +2087,8 @@ fn smart_pointers_type_as_their_pointee() {
         out.edges
     );
     assert!(
-        has_edge(&out, "k::go", "CALLS", "?::src/lib.rs::m"),
-        "a `Box<dyn Tr>` receiver is a trait object, typed by nobody here"
+        has_edge(&out, "k::go", "CALLS", "k::Tr::m"),
+        "a `Box<dyn Tr>` receiver answers with the trait's method"
     );
 }
 
@@ -2114,6 +2123,98 @@ fn eval_resolution_over_a_real_tree() {
     }
     let mut top: Vec<_> = ledger.into_iter().collect();
     top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    // Why each ledger entry could not be typed, by the shape of its receiver.
+    let mut why: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut heads: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut breaks: std::collections::BTreeMap<String, usize> = Default::default();
+    for e in out.edges.iter().filter(|e| e.dst.starts_with("?::")) {
+        let recv = match e.props.get("_recv") {
+            Some(Value::String(r)) => r.as_str(),
+            _ => {
+                *why.entry("no chain (index/await/closure/block/number)".into())
+                    .or_default() += 1;
+                continue;
+            }
+        };
+        let hops: Vec<&str> = recv.split('.').collect();
+        let head = hops[0];
+        let kind = if head == "self" {
+            "self.<field…> — a field's type unknown or external"
+        } else if head.starts_with('#') {
+            "literal head"
+        } else if head.ends_with("()") && head.contains("::") {
+            "path call — no return fact"
+        } else if head.ends_with("()") {
+            "bare call — no return fact"
+        } else if hops.len() == 1 {
+            "bare local — untyped binding"
+        } else {
+            "local chain — untyped binding or a hop with no return fact"
+        };
+        *why.entry(kind.into()).or_default() += 1;
+        if hops.len() == 1 && !head.ends_with("()") {
+            *heads.entry(head.to_string()).or_default() += 1;
+        }
+        if let Some(last) = hops.iter().rev().find(|h| h.ends_with("()")) {
+            *breaks.entry((*last).to_string()).or_default() += 1;
+        }
+    }
+    if let Ok(needle) = std::env::var("DRSG_EVAL_SHOW") {
+        eprintln!("ledger edges whose receiver or name contains `{needle}`:");
+        for e in out
+            .edges
+            .iter()
+            .filter(|e| e.dst.starts_with("?::"))
+            .filter(|e| {
+                e.dst.contains(&needle)
+                    || matches!(e.props.get("_recv"), Some(Value::String(r)) if r.contains(&needle))
+                    || matches!(e.props.get("_reason"), Some(Value::String(r)) if r.contains(&needle))
+            })
+            .take(40)
+        {
+            eprintln!(
+                "  {}  .{}  recv={:?}\n      {:?}",
+                e.src,
+                e.dst.rsplit("::").next().unwrap_or(""),
+                e.props.get("_recv"),
+                e.props.get("_reason")
+            );
+        }
+    }
+    eprintln!("why unresolved:");
+    for (k, n) in &why {
+        eprintln!("  {n:5}  {k}");
+    }
+    // The parser's own account, with names blanked so the shapes group.
+    let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
+    for e in out.edges.iter().filter(|e| e.dst.starts_with("?::")) {
+        if let Some(Value::String(r)) = e.props.get("_reason") {
+            let shape: String = r
+                .split('`')
+                .enumerate()
+                .map(|(i, part)| if i % 2 == 1 { "_" } else { part })
+                .collect();
+            *reasons.entry(shape).or_default() += 1;
+        }
+    }
+    let mut reasons: Vec<_> = reasons.into_iter().collect();
+    reasons.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    eprintln!("reasons:");
+    for (r, n) in reasons.iter().take(12) {
+        eprintln!("  {n:5}  {r}");
+    }
+    let mut heads: Vec<_> = heads.into_iter().collect();
+    heads.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    eprintln!("untyped bare locals:");
+    for (name, n) in heads.iter().take(25) {
+        eprintln!("  {n:5}  {name}");
+    }
+    let mut breaks: Vec<_> = breaks.into_iter().collect();
+    breaks.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    eprintln!("last call hop in an untyped chain:");
+    for (name, n) in breaks.iter().take(25) {
+        eprintln!("  {n:5}  {name}");
+    }
     eprintln!("nodes {} edges {}", out.nodes.len(), out.edges.len());
     eprintln!(
         "UnresolvedRef nodes {}",
@@ -2202,8 +2303,146 @@ fn std_returns_carry_a_chain_through_option_and_result() {
         clone.props.get("_confidence"),
         Some(&Value::String("medium".into()))
     );
-    // `unwrap_or(0)` hands back the Option's payload, which the parser has
-    // no type for — so `.max(1)` on it is in the ledger, not a guess.
-    assert!(calls.contains(&"?::src/lib.rs::max"), "{calls:?}");
+    // `find` is an `Option<usize>`, `unwrap_or(0)` its payload, and `max`
+    // on a `usize` is `Ord`'s.
+    assert!(calls.contains(&"Ord::max"), "{calls:?}");
+    every_edge_has_endpoints(&out);
+}
+
+/// Type arguments carry through every binding a body writes: `for n in
+/// &v` is a `Node` when `v: Vec<Node>`, so is `|n| …` handed to
+/// `v.iter().map(…)`, `Some(n)` of a `Option<Node>`, `(i, n)` of an
+/// `enumerate()`, `Node { key, .. }` of a match arm; a `type` alias is its
+/// target with the parameters filled in; a turbofish says what `collect`
+/// makes; and a closure whose body is a chain says what `map` yields.
+#[test]
+fn bindings_and_closures_type_through_generics() {
+    let t = Tree::new("ext-generics");
+    t.write("Cargo.toml", "[package]\nname = \"k\"\n").write(
+        "src/lib.rs",
+        concat!(
+            "use std::collections::HashMap;\n",
+            "pub struct Node { pub key: String, pub line: u64 }\n",
+            "impl Node { pub fn name(&self) -> String { self.key.clone() } }\n",
+            "pub struct Error;\n",
+            "pub type Result<T> = std::result::Result<T, Error>;\n",
+            "pub type Props = HashMap<String, Node>;\n",
+            "pub fn open() -> Result<Node> { Err(Error) }\n",
+            "pub fn go(v: Vec<Node>, m: &Props, o: Option<Node>) -> Result<()> {\n",
+            "    for n in &v { n.name(); }\n",
+            "    for (i, n) in v.iter().enumerate() { n.line; i.checked_add(1); }\n",
+            "    for (k, n) in m { k.len(); n.name(); }\n",
+            "    if let Some(n) = o { n.name(); }\n",
+            "    match m.get(\"x\") { Some(Node { key, .. }) => { key.trim(); } None => {} }\n",
+            "    let names: Vec<String> = v.iter().map(|n| n.name()).collect();\n",
+            "    names.first();\n",
+            "    let lens = v.iter().map(|n| n.key.len()).collect::<Vec<_>>();\n",
+            "    lens.iter().sum::<usize>().checked_add(1);\n",
+            "    let first = v.iter().map(|n| n.name()).next();\n",
+            "    first.unwrap().trim();\n",
+            "    let n = open()?;\n",
+            "    n.name();\n",
+            "    let props = Props::new();\n",
+            "    props.insert(String::new(), Node { key: String::new(), line: 0 });\n",
+            "    v.iter().filter(|n| n.line > 0).for_each(|n| { n.name(); });\n",
+            "    Ok(())\n",
+            "}\n",
+        ),
+    );
+    let out = run(&t);
+    let calls: Vec<&str> = out
+        .edges
+        .iter()
+        .filter(|e| e.ty == "CALLS" && e.src == "k::go")
+        .map(|e| e.dst.as_str())
+        .collect();
+    let ledger: Vec<String> = out
+        .edges
+        .iter()
+        .filter(|e| e.src == "k::go" && e.dst.starts_with("?::"))
+        .map(|e| format!("{} {:?}", e.dst, e.props.get("_reason")))
+        .collect();
+    for target in [
+        "k::Node::name",
+        "usize::checked_add",
+        "String::len",
+        "String::trim",
+        "Vec::first",
+        "Vec::iter",
+        "Iterator::map",
+        "Iterator::collect",
+        "Iterator::sum",
+        "Iterator::next",
+        "Option::unwrap",
+        "std::collections::HashMap::insert",
+        "Iterator::filter",
+        "Iterator::for_each",
+    ] {
+        assert!(
+            calls.contains(&target),
+            "{target} missing from {calls:?}\n{ledger:#?}"
+        );
+    }
+    assert!(ledger.is_empty(), "every receiver was typed: {ledger:#?}");
+    every_edge_has_endpoints(&out);
+}
+
+/// What a body names beyond its locals types too: a constant by its
+/// declaration; a `match` arm's `Variant(x)` by the enum's own fields,
+/// whether the pattern spells the enum or imports the variant; `let (a, b)
+/// = (x, y)` each side by side; and `let e = e?;` re-binds `e` from what it
+/// was, so both the old and the new `e` type.
+#[test]
+fn constants_variants_and_rebindings_type() {
+    let t = Tree::new("ext-consts");
+    t.write("Cargo.toml", "[package]\nname = \"k\"\n").write(
+        "src/lib.rs",
+        concat!(
+            "pub const NAMES: &[&str] = &[\"a\"];\n",
+            "pub static COUNT: usize = 1;\n",
+            "pub struct Txn;\nimpl Txn { pub fn commit(self) {} }\n",
+            "pub struct Plan;\nimpl Plan { pub fn run(&self) {} }\n",
+            "pub enum Stmt { Write(Txn), Read { plan: Plan }, Nothing }\n",
+            "use Stmt::Read;\n",
+            "pub fn go(s: Stmt, r: Result<Txn, ()>) {\n",
+            "    NAMES.iter().count();\n",
+            "    COUNT.checked_add(1);\n",
+            "    match s { Stmt::Write(t) => t.commit(), Read { plan } => plan.run(), Stmt::Nothing => {} }\n",
+            "    let (a, b) = (Vec::<u8>::new(), String::new());\n",
+            "    a.len(); b.trim();\n",
+            "    let r = r.unwrap();\n",
+            "    r.commit();\n",
+            "}\n",
+        ),
+    );
+    let out = run(&t);
+    let calls: Vec<&str> = out
+        .edges
+        .iter()
+        .filter(|e| e.ty == "CALLS" && e.src == "k::go")
+        .map(|e| e.dst.as_str())
+        .collect();
+    let ledger: Vec<String> = out
+        .edges
+        .iter()
+        .filter(|e| e.src == "k::go" && e.dst.starts_with("?::"))
+        .map(|e| format!("{} {:?}", e.dst, e.props.get("_reason")))
+        .collect();
+    for target in [
+        "slice::iter",
+        "Iterator::count",
+        "usize::checked_add",
+        "k::Txn::commit",
+        "k::Plan::run",
+        "Vec::len",
+        "String::trim",
+        "Result::unwrap",
+    ] {
+        assert!(
+            calls.contains(&target),
+            "{target} missing from {calls:?}\n{ledger:#?}"
+        );
+    }
+    assert!(ledger.is_empty(), "every receiver was typed: {ledger:#?}");
     every_edge_has_endpoints(&out);
 }

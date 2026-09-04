@@ -73,15 +73,23 @@ carries `_code`: the source as written, described as retrieval-only — the
 - A **bare name** binds by scope proximity; a name with two equally-close
   candidates is **ambiguous — counted, not guessed**.
 - A **method call** (`.read()`) names no path; it resolves as far as the
-  receiver's type can be **read off the body** — a parameter or `let`
-  annotation, a field's declared type, a constructor path (`Vec::new()`), a
-  declared return, and chains of those (`self.items.iter().map(…)`), with
-  `?`/`.unwrap()` peeling a declared `Result`/`Option`. A type this tree
-  declares lands on its own method; a type it does not — std's, a
-  dependency's — lands on an external stand-in keyed `Type::method`
-  (`Vec::push`, `str::trim`, `Iterator::map`), which is all that is known
-  about it. A receiver whose type nothing states, or a generic parameter,
-  is **counted, never guessed**.
+  receiver's type can be **read off the body**. Type arguments carry through
+  every binding a body writes: a parameter or `let` annotation, a field's
+  declared type, a constructor path (`Vec::new()`), a declared return, a
+  `type` alias with its parameters filled in, a constant, and chains of
+  those (`self.items.iter().map(…)`) through a table of what std's own
+  methods return — so `for n in &v`, `if let Some(n) = …`, `match` arms on
+  the tree's own enums, `let (a, b) = …`, `Node { key, .. }` and the
+  parameters of `v.iter().map(|n| …)` are typed, `?`/`.unwrap()` reach a
+  `Result<T>`'s `T`, a closure whose body is a chain says what `map`
+  yields, and `collect::<Vec<_>>()` is a `Vec`. A type this tree declares
+  lands on its own method; `T: Tr`, `impl Tr` and `dyn Tr` land on the
+  trait's; a type the tree does not declare — std's, a dependency's — lands
+  on an external stand-in keyed `Type::method` (`Vec::push`, `str::trim`,
+  `Iterator::map`, `Clone::clone`), which is all that is known about it. A
+  receiver whose type nothing states — an unbounded generic, the result of
+  a foreign function no table knows — is **counted, never guessed**, and
+  the ledger edge says which hop stopped it.
 - **Re-exports** (`pub use`, including `pub(crate) use`) create the facade
   paths later references resolve through.
 - A key seen twice is nearly always two `#[cfg]` alternatives of one item —
