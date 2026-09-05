@@ -48,7 +48,7 @@ example.com/demo/sub.Counter.Add      方法——path.Type.Method
 |---|---|---|
 | `CONTAINS` | 包 → 声明、接收者类型 → 方法 | 声明处 |
 | `HAS_METHOD` | 接口 → 其要求的方法 | 成员所在行 |
-| `CALLS` | 函数 → 被调者。`go f()` 在边上带 `concurrent`：控制确实到达被调者，但在另一个 goroutine 上；分不清二者的图描述的是另一个程序 | 调用处 |
+| `CALLS` | 函数 → 被调者。`go f()` 在边上带 `concurrent: go`：控制确实到达被调者，但在另一个 goroutine 上；分不清二者的图描述的是另一个程序 | 调用处 |
 | `IMPORTS` | 包 → 包（树内或外部） | import 语句 |
 | `IMPLEMENTS` | 类型 → 接口——**特意无行号**：Go 的实现关系是结构性的，哪里都没写下来 |
 | `SENDS` | 函数 → 它写入的通道（`ch <- v`） | 发送处 |

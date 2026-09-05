@@ -54,11 +54,23 @@ function boot` → `….boot`, reachable as `default`), else `default`.
 |---|---|---|
 | `CONTAINS` | package → module → decl, class → member | declaration site |
 | `HAS_METHOD` | interface → its method nodes | member |
-| `CALLS` | fn → callee; `new Foo()` counts as a call to the class; a rendered JSX component (`<Foo />`, uppercase) is a call | call site |
+| `CALLS` | fn → callee; `new Foo()` counts as a call to the class; a rendered JSX component (`<Foo />`, uppercase) is a call. Carries `concurrent` when a site departs from waiting: `scheduled` (handed to `Promise.all`/`race`/`any`, `setTimeout`, `queueMicrotask`) or `unawaited` (a promise called as a statement, which nothing here awaits and no `.then` follows) | call site |
 | `IMPORTS` | module → module (relative) or → external package (bare specifier) | import statement |
+| `REFERENCES` | fn → a function it **passes as a value** rather than calls; carries `concurrent: scheduled` when a scheduler was handed the function itself | the argument |
 | `IMPLEMENTS` / `EXTENDS` | `class C implements I` / class→class, interface→interface — **syntactic** in TS, so certain where Go's structural check could not be | class/interface declaration |
 
 ## Resolution — the certainty line
+
+- **Concurrency is a fact about the call site, not the declaration.**
+  `is_async` says a function returns a promise; only the call says whether
+  anyone awaited it, and `await f()`, `Promise.all([f()])` and a bare `f()`
+  are three different programs. Only the departures are recorded — inside an
+  async body an `await` is the expectation. One caller reaching one callee
+  several ways folds to one edge carrying the **union** of what it does, so
+  an awaited site cannot swallow a floating one by being written first.
+  `unawaited` is claimed only of an async callee: `log(x)` is a statement
+  whose result is discarded too, and there was nothing there to await; a
+  `.then` handles the promise, so the call it follows is not floating.
 
 - **Relative specifiers** resolve against the parsed file set only — no
   filesystem guessing. `./x.js` probes `x.ts`, `x.tsx`, … (ESM writes the

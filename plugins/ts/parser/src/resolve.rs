@@ -5,7 +5,7 @@
 //! boundaries fell, and does not: everything keys on file-order-stable
 //! indexes, never on how the facts were batched.
 
-use crate::{CallKind, EXTENSIONS, Edge, FileFacts, Node, Props, edge_at};
+use crate::{CallKind, EXTENSIONS, Edge, FileFacts, Node, Props, Shape, edge_at};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -207,17 +207,27 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
         }
     }
 
-    let mut edge_set: BTreeSet<(String, String, String)> = BTreeSet::new();
     let mut pending_edges: Vec<Edge> = Vec::new();
+    // One caller may reach one callee several ways — `await f()` on one line
+    // and `Promise.all([f()])` on the next — and they fold to a single edge.
+    // The union is the honest statement: what this caller does with this
+    // callee *somewhere*, rather than whichever site the walk reached first,
+    // which is how an awaited site silently swallowed a scheduled one.
+    let mut at: BTreeMap<(String, String, String), usize> = BTreeMap::new();
     let add_edge =
-        |pending: &mut Vec<Edge>, set: &mut BTreeSet<(String, String, String)>, e: Edge| {
-            if set.insert((e.src.clone(), e.ty.clone(), e.dst.clone())) {
-                pending.push(e);
+        |pending: &mut Vec<Edge>, at: &mut BTreeMap<(String, String, String), usize>, e: Edge| {
+            let k = (e.src.clone(), e.ty.clone(), e.dst.clone());
+            match at.get(&k) {
+                None => {
+                    at.insert(k, pending.len());
+                    pending.push(e);
+                }
+                Some(&i) => merge_concurrent(&mut pending[i], &e),
             }
         };
     for f in &all {
         for e in &f.edges {
-            add_edge(&mut pending_edges, &mut edge_set, e.clone());
+            add_edge(&mut pending_edges, &mut at, e.clone());
         }
     }
 
@@ -247,7 +257,7 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
             if m != pkg {
                 add_edge(
                     &mut pending_edges,
-                    &mut edge_set,
+                    &mut at,
                     Edge {
                         src: pkg.clone(),
                         dst: m.clone(),
@@ -267,14 +277,14 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
             match ix.resolve_spec(&f.file, spec) {
                 Resolved::Module(target) => add_edge(
                     &mut pending_edges,
-                    &mut edge_set,
+                    &mut at,
                     edge_at(&f.module_id, &target, "IMPORTS", *line),
                 ),
                 Resolved::External(pkg) => {
                     note_external(&seen, &mut external, &pkg, "Package");
                     add_edge(
                         &mut pending_edges,
-                        &mut edge_set,
+                        &mut at,
                         edge_at(&f.module_id, &pkg, "IMPORTS", *line),
                     );
                 }
@@ -459,6 +469,56 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
             .flatten()
             .find_map(|b| method_walk(methods, bases, b, name, depth - 1))
     }
+    /// Put the call site's concurrency on its edge, when it had any.
+    ///
+    /// Scheduling is evident from the syntax whatever the callee is —
+    /// `setTimeout(tick)` runs a plain function beside its caller. Being
+    /// unawaited is only a fact about something there was any point
+    /// awaiting: `log(x)` is a statement whose result is discarded too.
+    fn shaped(mut e: Edge, shape: Option<Shape>, callee_is_async: bool) -> Edge {
+        match shape {
+            Some(shape) if shape == Shape::Scheduled || callee_is_async => {
+                e.props.insert(
+                    "concurrent".into(),
+                    Value::String(shape.as_str().to_string()),
+                );
+            }
+            _ => {}
+        }
+        e
+    }
+
+    /// Fold a repeated edge's concurrency into the one already kept, so an
+    /// edge states every shape its sites had rather than the first.
+    fn merge_concurrent(kept: &mut Edge, other: &Edge) {
+        let Some(Value::String(add)) = other.props.get("concurrent") else {
+            return;
+        };
+        // Sorted, so the same tree gives the same text whichever site the
+        // walk reached first.
+        let merged = match kept.props.get("concurrent") {
+            Some(Value::String(have)) if have.split(", ").any(|p| p == add) => return,
+            Some(Value::String(have)) => {
+                let mut parts: Vec<&str> = have.split(", ").chain([add.as_str()]).collect();
+                parts.sort_unstable();
+                parts.join(", ")
+            }
+            _ => add.clone(),
+        };
+        kept.props
+            .insert("concurrent".into(), Value::String(merged));
+    }
+
+    // Which declared keys are async. See [`shaped`].
+    let mut coroutines: BTreeSet<String> = BTreeSet::new();
+    for f in &all {
+        for n in &f.nodes {
+            if n.props.get("is_async") == Some(&Value::Bool(true)) {
+                coroutines.insert(n.key.clone());
+            }
+        }
+    }
+
     // A resolution stamp for the typed paths, matching the family shape.
     let stamped = |src: &str, dst: &str, line: u64, strategy: &str, written: &str| -> Edge {
         let mut e = edge_at(src, dst, "CALLS", line);
@@ -532,8 +592,12 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
                     match resolve_name(&c.name, true, &mut external, &mut external_calls) {
                         Some(key) => add_edge(
                             &mut pending_edges,
-                            &mut edge_set,
-                            edge_at(&c.caller, &key, "CALLS", c.line),
+                            &mut at,
+                            shaped(
+                                edge_at(&c.caller, &key, "CALLS", c.line),
+                                c.shape,
+                                coroutines.contains(&key),
+                            ),
                         ),
                         None => unresolved += 1,
                     }
@@ -544,8 +608,12 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
                         Resolved::Module(target) => match ix.lookup_export(&target, &c.name, 0) {
                             Some(key) => add_edge(
                                 &mut pending_edges,
-                                &mut edge_set,
-                                edge_at(&c.caller, &key, "CALLS", c.line),
+                                &mut at,
+                                shaped(
+                                    edge_at(&c.caller, &key, "CALLS", c.line),
+                                    c.shape,
+                                    coroutines.contains(&key),
+                                ),
                             ),
                             None => unresolved += 1,
                         },
@@ -556,8 +624,12 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
                             external_calls += 1;
                             add_edge(
                                 &mut pending_edges,
-                                &mut edge_set,
-                                edge_at(&c.caller, &key, "CALLS", c.line),
+                                &mut at,
+                                shaped(
+                                    edge_at(&c.caller, &key, "CALLS", c.line),
+                                    c.shape,
+                                    coroutines.contains(&key),
+                                ),
                             );
                         }
                         Resolved::Miss => unresolved += 1,
@@ -582,8 +654,12 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
                         match receiver {
                             Some((key, how)) => add_edge(
                                 &mut pending_edges,
-                                &mut edge_set,
-                                stamped(&c.caller, &key, c.line, how, &written),
+                                &mut at,
+                                shaped(
+                                    stamped(&c.caller, &key, c.line, how, &written),
+                                    c.shape,
+                                    coroutines.contains(&key),
+                                ),
                             ),
                             None => unresolved += 1,
                         }
@@ -594,8 +670,12 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
                     match method_walk(&ix.class_methods, &bases_ix, &class_key, &c.name, 5) {
                         Some(key) => add_edge(
                             &mut pending_edges,
-                            &mut edge_set,
-                            edge_at(&c.caller, &key, "CALLS", c.line),
+                            &mut at,
+                            shaped(
+                                edge_at(&c.caller, &key, "CALLS", c.line),
+                                c.shape,
+                                coroutines.contains(&key),
+                            ),
                         ),
                         None => unresolved += 1,
                     }
@@ -612,7 +692,7 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
                     match hit {
                         Some(key) => add_edge(
                             &mut pending_edges,
-                            &mut edge_set,
+                            &mut at,
                             stamped(
                                 &c.caller,
                                 &key,
@@ -632,7 +712,7 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
                     match hit {
                         Some(key) => add_edge(
                             &mut pending_edges,
-                            &mut edge_set,
+                            &mut at,
                             stamped(
                                 &c.caller,
                                 &key,
@@ -652,7 +732,7 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
                     match hit {
                         Some(key) => add_edge(
                             &mut pending_edges,
-                            &mut edge_set,
+                            &mut at,
                             stamped(
                                 &c.caller,
                                 &key,
@@ -671,7 +751,7 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
         // in argument position — declared here or imported — becomes a
         // REFERENCES edge. Classes stay out (not fn values in TS); silent
         // on a miss; never a self-loop.
-        for (caller, line, name) in &f.fn_refs {
+        for (caller, line, name, scheduled) in &f.fn_refs {
             let target = match ix.decls.get(&f.module_id).and_then(|d| d.get(name)) {
                 Some((key, callable)) if *callable && !classes.contains(key) => Some(key.clone()),
                 _ => match bindings.get(name.as_str()) {
@@ -697,7 +777,13 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
             {
                 let mut e = stamped(caller, &target, *line, "fn-ref", name);
                 e.ty = "REFERENCES".into();
-                add_edge(&mut pending_edges, &mut edge_set, e);
+                if *scheduled {
+                    e.props.insert(
+                        "concurrent".into(),
+                        Value::String(Shape::Scheduled.as_str().to_string()),
+                    );
+                }
+                add_edge(&mut pending_edges, &mut at, e);
             }
         }
 
@@ -727,7 +813,7 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
                     }
                     add_edge(
                         &mut pending_edges,
-                        &mut edge_set,
+                        &mut at,
                         edge_at(class_key, &key, ty, *line),
                     );
                 }

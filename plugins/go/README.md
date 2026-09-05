@@ -51,7 +51,7 @@ node it could only be a key collision, and its calls are wiring, not API.
 |---|---|---|
 | `CONTAINS` | package → decl, receiver type → method | declaration site |
 | `HAS_METHOD` | interface → its demanded methods | member's line |
-| `CALLS` | function → callee. A `go f()` carries `concurrent` on the edge: control does reach the callee, but on another goroutine, and a graph that cannot tell the two apart describes a different program | call site |
+| `CALLS` | function → callee. A `go f()` carries `concurrent: go` on the edge: control does reach the callee, but on another goroutine, and a graph that cannot tell the two apart describes a different program | call site |
 | `IMPORTS` | package → package (in-tree or external) | import statement |
 | `IMPLEMENTS` | type → interface — **no line**, deliberately: satisfaction is structural in Go; nothing is written anywhere |
 | `SENDS` | function → a channel it writes to (`ch <- v`) | the send |

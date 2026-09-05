@@ -52,11 +52,20 @@ acme/src/api.Client.connect           类成员
 |---|---|---|
 | `CONTAINS` | 包 → 模块 → 声明、类 → 成员 | 声明处 |
 | `HAS_METHOD` | 接口 → 其方法节点 | 成员 |
-| `CALLS` | 函数 → 被调者；`new Foo()` 记为对类的调用；渲染的 JSX 组件（`<Foo />`，大写开头）就是调用 | 调用处 |
+| `CALLS` | 函数 → 被调者；`new Foo()` 记为对类的调用；渲染的 JSX 组件（`<Foo />`，大写开头）就是调用。当某处调用不再等待时带 `concurrent`：`scheduled`（交给 `Promise.all`/`race`/`any`、`setTimeout`、`queueMicrotask`）或 `unawaited`（Promise 作为语句被调用，此处无人 await、其后也没有 `.then`） | 调用处 |
 | `IMPORTS` | 模块 → 模块（相对）或 → 外部包（裸 specifier） | import 语句 |
+| `REFERENCES` | 函数 → 它**作为值传递**（而非调用）的函数；调度器拿到的若是函数本身，则带 `concurrent: scheduled` | 该实参 |
 | `IMPLEMENTS` / `EXTENDS` | `class C implements I` / 类→类、接口→接口——TS 里是**句法**，因此确定，Go 的结构性检查做不到这一点 | 类/接口声明 |
 
 ## 解析——确定性的界线
+
+- **并发是调用处的事实，而非声明处的。** `is_async` 说明函数返回 Promise；
+  只有调用才说明是否有人 await 它，而 `await f()`、`Promise.all([f()])` 与
+  裸 `f()` 是三个不同的程序。只记录偏离：在 async 体内 `await` 才是预期。
+  同一调用者以多种方式到达同一被调者时会折叠为一条边，边上带的是这些方式的
+  **并集**，因此先写下的 await 处不会吞掉悬空处。`unawaited` 只对 async
+  被调者成立：`log(x)` 同样是丢弃结果的语句，但那里本就没有可等待之物；
+  `.then` 已经接手了 Promise，因此它跟随的调用并不悬空。
 
 - **相对 specifier** 只对已解析的文件集合解析——不做文件系统猜测。
   `./x.js` 依次探测 `x.ts`、`x.tsx`……（ESM 写的是产物扩展名），再探

@@ -42,8 +42,8 @@ func stamped(src, dst string, line int, strategy, band, written string) Edge {
 // program than the one on disk.
 func spawns(e Edge) Edge {
 	e.Props["concurrent"] = map[string]any{
-		"$desc":  "started with `go`: control reaches the callee on another goroutine, not in this one",
-		"$value": true,
+		"$desc":  "how control departs from waiting for this callee: `go` starts it on another goroutine",
+		"$value": "go",
 	}
 	return e
 }

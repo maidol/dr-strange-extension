@@ -898,3 +898,96 @@ fn callback_params_type_through_the_callees_annotation() {
             .collect::<Vec<_>>()
     );
 }
+
+/// The `concurrent` value on a CALLS edge, or "" when it carries none.
+fn concurrency(a: &Assembled, src: &str, dst: &str) -> String {
+    a.edges
+        .iter()
+        .find(|e| e.src == src && e.ty == "CALLS" && e.dst == dst)
+        .and_then(|e| e.props.get("concurrent"))
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// JavaScript has no channel and no goroutine; its whole concurrency is
+/// where control stops waiting, and that is written at the call site.
+/// `is_async` said a function returns a promise; nothing said whether anyone
+/// awaited it, and `await f()`, `Promise.all([f()])` and a bare `f()` were
+/// one indistinguishable edge.
+#[test]
+fn a_call_site_says_whether_anyone_awaits_the_promise() {
+    let m = tree(vec![(
+        "app.ts",
+        r#"
+export async function fetchOne(u: string) { return u }
+export async function worker() { return 1 }
+export function tick() { return 2 }
+
+export async function main() {
+  await fetchOne("a")
+  await Promise.all([fetchOne("b"), worker()])
+  setTimeout(tick, 0)
+}
+"#,
+    )]);
+    let a = run(&m);
+    assert_eq!(
+        concurrency(&a, "package/app.main", "package/app.fetchOne"),
+        "scheduled"
+    );
+    assert_eq!(
+        concurrency(&a, "package/app.main", "package/app.worker"),
+        "scheduled"
+    );
+    // Scheduling is evident from the syntax whatever the callee is — and a
+    // scheduler handed the function itself rather than a promise runs it
+    // beside its caller though nothing in this body ever calls it.
+    let handed = a
+        .edges
+        .iter()
+        .find(|e| {
+            e.src == "package/app.main" && e.ty == "REFERENCES" && e.dst == "package/app.tick"
+        })
+        .and_then(|e| e.props.get("concurrent"))
+        .and_then(|v| v.as_str());
+    assert_eq!(handed, Some("scheduled"), "{:?}", a.edges);
+}
+
+/// A floating promise — called as a statement, nothing awaits it, no `.then`
+/// follows — is the unhandled-rejection shape and the one the graph could
+/// not show at all. A plain call discarded the same way is not concurrency.
+#[test]
+fn a_floating_promise_is_marked_and_a_plain_statement_is_not() {
+    let m = tree(vec![(
+        "app.ts",
+        r#"
+export async function fetchOne(u: string) { return u }
+export function log(m: string) { return m }
+export async function worker() { return 1 }
+
+export async function main() {
+  fetchOne("forgotten")
+  void fetchOne("deliberate")
+  log("fine")
+  fetchOne("chained").then(() => worker())
+  await fetchOne("waited")
+}
+"#,
+    )]);
+    let a = run(&m);
+    // One caller reaches one callee several ways and they fold to one edge,
+    // so the union is the honest statement — the awaited site must not
+    // swallow the floating one merely by being written last.
+    assert_eq!(
+        concurrency(&a, "package/app.main", "package/app.fetchOne"),
+        "unawaited"
+    );
+    // Discarding a plain call's result is not concurrency: there was
+    // nothing there to await.
+    assert_eq!(concurrency(&a, "package/app.main", "package/app.log"), "");
+    // A `.then` handles the promise, so the call it follows is not floating.
+    assert_eq!(
+        concurrency(&a, "package/app.main", "package/app.worker"),
+        ""
+    );
+}

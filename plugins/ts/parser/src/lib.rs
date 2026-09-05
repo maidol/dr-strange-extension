@@ -70,6 +70,40 @@ pub struct Call {
     pub kind: CallKind,
     pub name: String,
     pub line: u64,
+    /// How the call site relates to the promise's settlement, when it
+    /// departs from waiting for it — see [`Shape`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<Shape>,
+}
+
+/// What a call site says about concurrency, when it says anything.
+///
+/// JavaScript has no channel and no goroutine; its whole concurrency is
+/// *where control stops waiting*, and that is written at the call site.
+/// `is_async` on a function says it returns a promise; only the call says
+/// whether anyone awaited it. `await f()`, `Promise.all([f(), g()])` and a
+/// bare `f()` are three different programs and were one CALLS edge.
+///
+/// Only the departures are recorded: inside an async body an `await` is the
+/// expectation, and marking every one would put a property on nearly every
+/// edge to say nothing unusual happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Shape {
+    /// Started beside its siblings — `Promise.all`, `setTimeout`,
+    /// `queueMicrotask`.
+    Scheduled,
+    /// A floating promise: called as a statement, nothing here awaits it and
+    /// no `.then` follows. The unhandled-rejection shape.
+    Unawaited,
+}
+
+impl Shape {
+    fn as_str(self) -> &'static str {
+        match self {
+            Shape::Scheduled => "scheduled",
+            Shape::Unawaited => "unawaited",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,7 +209,10 @@ pub struct FileFacts {
     /// Type bindings the source states (annotations, `new`, factories).
     pub hints: Vec<Hint>,
     /// `(caller, bare name, line)` — functions passed as call arguments.
-    pub fn_refs: Vec<(String, u64, String)>,
+    /// `(caller, line, bare name, scheduled)` — a function handed as a
+    /// value. `setTimeout(tick)` schedules `tick` itself, which is a
+    /// concurrency fact about a name this body never calls.
+    pub fn_refs: Vec<(String, u64, String, bool)>,
     /// `(caller, callee bare name, arg index, callback param names)` —
     /// inline callbacks whose params the callee's annotation may type.
     pub callback_uses: Vec<(String, String, usize, Vec<String>)>,
@@ -1329,6 +1366,7 @@ impl Walker<'_> {
             walker: self,
             caller: caller.to_string(),
             in_class: class.map(|(n, _)| n.to_string()),
+            shapes: std::collections::BTreeMap::new(),
         };
         body.visit_with(&mut v);
     }
@@ -1338,6 +1376,7 @@ impl Walker<'_> {
             walker: self,
             caller: caller.to_string(),
             in_class: class.map(|(n, _)| n.to_string()),
+            shapes: std::collections::BTreeMap::new(),
         };
         expr.visit_with(&mut v);
     }
@@ -1538,12 +1577,67 @@ struct CallCollector<'a, 'b> {
     walker: &'a mut Walker<'b>,
     caller: String,
     in_class: Option<String>,
+    /// The shape recorded for a call, by where its span starts.
+    ///
+    /// The visit gives no parents, and the concurrency of a call is entirely
+    /// a fact about its parent: `await f()`, `Promise.all([f()])` and a bare
+    /// `f()` differ nowhere inside the `f()`. Each parent stamps its
+    /// children on the way down, and the call reads its own stamp when the
+    /// walk arrives.
+    shapes: std::collections::BTreeMap<u32, Shape>,
+}
+
+/// Whether a callee starts what it is handed beside its caller.
+///
+/// `all`/`race` are matched only under `Promise`, because a method called
+/// `all` on anything else schedules nothing.
+fn schedules(callee: &ast::Expr) -> bool {
+    match callee {
+        ast::Expr::Ident(i) => matches!(
+            &*i.sym,
+            "setTimeout" | "setInterval" | "setImmediate" | "queueMicrotask"
+        ),
+        ast::Expr::Member(m) => {
+            let Some(prop) = m.prop.as_ident().map(|p| p.sym.to_string()) else {
+                return false;
+            };
+            match &*m.obj {
+                ast::Expr::Ident(o) if o.sym == *"Promise" => {
+                    matches!(&*prop, "all" | "allSettled" | "race" | "any")
+                }
+                ast::Expr::Ident(o) if o.sym == *"process" => prop == "nextTick",
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 impl CallCollector<'_, '_> {
+    /// Stamp a call expression, looking through the wrappers that carry one
+    /// without changing what it is: an array of promises handed to
+    /// `Promise.all`, a `void f()` that floats one deliberately.
+    fn stamp(&mut self, e: &ast::Expr, shape: Shape) {
+        match e {
+            ast::Expr::Call(c) => {
+                self.shapes.insert(c.span.lo.0, shape);
+            }
+            ast::Expr::Array(a) => {
+                for item in a.elems.iter().flatten() {
+                    self.stamp(&item.expr, shape);
+                }
+            }
+            ast::Expr::Unary(u) if u.op == ast::UnaryOp::Void => self.stamp(&u.arg, shape),
+            ast::Expr::Paren(p) => self.stamp(&p.expr, shape),
+            _ => {}
+        }
+    }
+
     fn push(&mut self, kind: CallKind, name: String, span: Span) {
         let line = self.walker.line(span);
+        let shape = self.shapes.remove(&span.lo.0);
         self.walker.facts.calls.push(Call {
+            shape,
             caller: self.caller.clone(),
             kind,
             name,
@@ -1553,7 +1647,7 @@ impl CallCollector<'_, '_> {
 }
 
 impl CallCollector<'_, '_> {
-    fn arg_refs(&mut self, args: &[ast::ExprOrSpread], line_span: Span) {
+    fn arg_refs(&mut self, args: &[ast::ExprOrSpread], line_span: Span, scheduled: bool) {
         for a in args {
             if a.spread.is_none()
                 && let ast::Expr::Ident(i) = &*a.expr
@@ -1563,7 +1657,7 @@ impl CallCollector<'_, '_> {
                 self.walker
                     .facts
                     .fn_refs
-                    .push((caller, line, i.sym.to_string()));
+                    .push((caller, line, i.sym.to_string(), scheduled));
             }
         }
     }
@@ -1585,7 +1679,35 @@ impl CallCollector<'_, '_> {
 }
 
 impl Visit for CallCollector<'_, '_> {
+    /// A call standing alone as a statement throws its result away. For a
+    /// promise that means nothing here awaits it — the `await` that would
+    /// have is simply absent. Stamped for every callee and kept at assemble
+    /// only for the ones that are async, because `console.log(x)` is a
+    /// statement too and there is nothing there to await.
+    fn visit_expr_stmt(&mut self, node: &ast::ExprStmt) {
+        self.stamp(&node.expr, Shape::Unawaited);
+        node.visit_children_with(self);
+    }
+
+    /// `await f()` waits for the promise here, so it is the ordinary case
+    /// and clears any `unawaited` the statement above stamped.
+    fn visit_await_expr(&mut self, node: &ast::AwaitExpr) {
+        if let ast::Expr::Call(c) = &*node.arg {
+            self.shapes.remove(&c.span.lo.0);
+        }
+        node.visit_children_with(self);
+    }
+
     fn visit_call_expr(&mut self, node: &ast::CallExpr) {
+        // A scheduler starts everything it is handed beside its caller.
+        if let ast::Callee::Expr(callee) = &node.callee
+            && schedules(callee)
+        {
+            let args: Vec<ast::ExprOrSpread> = node.args.clone();
+            for a in &args {
+                self.stamp(&a.expr, Shape::Scheduled);
+            }
+        }
         if let ast::Callee::Expr(expr) = &node.callee {
             match &**expr {
                 ast::Expr::Ident(i) => {
@@ -1657,7 +1779,11 @@ impl Visit for CallCollector<'_, '_> {
                 _ => self.walker.facts.opaque += 1,
             }
         }
-        self.arg_refs(&node.args, node.span);
+        self.arg_refs(
+            &node.args,
+            node.span,
+            matches!(&node.callee, ast::Callee::Expr(c) if schedules(c)),
+        );
         if let ast::Callee::Expr(callee) = &node.callee {
             self.callback_uses(callee, &node.args);
         }
