@@ -79,9 +79,10 @@ crate 名来自最近的 `Cargo.toml` 的 `[package] name`（`-` → `_`），�
   都有类型，`?`/`.unwrap()` 抵达 `Result<T>` 的 `T`，函数体是链式表达式的
   闭包说明 `map` 产出什么，`collect::<Vec<_>>()` 是 `Vec`。本树声明的类型
   落到它自己的方法上；`T: Tr`、`impl Tr` 与 `dyn Tr` 落到 trait 的方法上；
-  本树未声明的类型——std 的、依赖的——落到键为 `Type::method` 的外部替身上
-  （`Vec::push`、`str::trim`、`Iterator::map`、`Clone::clone`），这就是关于它
-  所知的全部。没有任何东西陈述其类型的接收者——无约束的泛型、没有任何表
+  本树未声明的类型——std 的、依赖的——落到外部替身上，其键取**声明**该方法
+  的类型：`Vec::push`、`str::trim`、`Clone::clone`，以及每个通过 trait 作答
+  的具体迭代器（`Range`、`Lines`、`Chars`）共用的 `Iterator::collect`——这就
+  是关于它所知的全部。没有任何东西陈述其类型的接收者——无约束的泛型、没有任何表
   认识的外部函数的结果——**计数，绝不猜测**，且账本边会说明是哪一跳停下的。
 - **重导出**（`pub use`，含 `pub(crate) use`）创建后续引用赖以解析的
   门面路径。

@@ -2568,10 +2568,22 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
                     Ok((format!("{tr}::{name}"), "std-trait", "medium"))
                 }
                 Ty::External(path, _) => {
-                    if std_method(&ty, name).is_none()
-                        && let Some((tr, _)) = std_trait(name)
-                    {
+                    let answered = std_method(&ty, name).is_some();
+                    if !answered && let Some((tr, _)) = std_trait(name) {
                         return Ok((format!("{tr}::{name}"), "std-trait", "medium"));
+                    }
+                    // `Range::collect` is a lie: `Range` declares no
+                    // `collect`, it *is* an `Iterator` and `Iterator` declares
+                    // it. Keyed by the receiver, one method scatters into a
+                    // node per concrete iterator a tree happens to build —
+                    // `Range::map`, `Lines::map`, `Chars::map` — and "who
+                    // calls `Iterator::map`?" answers with a fraction of
+                    // them. The node is the type that *answers* the call, so
+                    // one method is one node. An inherent method a concrete
+                    // iterator does declare (`Chars::as_str`) is answered by
+                    // nothing in the iterator table and keeps its own name.
+                    if answered && as_iterator(&ty).is_some() {
+                        return Ok((format!("Iterator::{name}"), "std-iterator", "high"));
                     }
                     Ok((format!("{path}::{name}"), "external-receiver", "high"))
                 }
@@ -2687,7 +2699,7 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
         // UnresolvedRef the graph can answer for.
         let why = match typed_target(&caller, &call) {
             Ok((target, strategy, band)) => {
-                if matches!(strategy, "external-receiver" | "std-trait") {
+                if matches!(strategy, "external-receiver" | "std-trait" | "std-iterator") {
                     note_external(&mut external, &target, Some("Method"));
                     external_calls += 1;
                 }

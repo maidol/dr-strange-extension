@@ -87,8 +87,10 @@ carries `_code`: the source as written, described as retrieval-only — the
   yields, and `collect::<Vec<_>>()` is a `Vec`. A type this tree declares
   lands on its own method; `T: Tr`, `impl Tr` and `dyn Tr` land on the
   trait's; a type the tree does not declare — std's, a dependency's — lands
-  on an external stand-in keyed `Type::method` (`Vec::push`, `str::trim`,
-  `Iterator::map`, `Clone::clone`), which is all that is known about it. A
+  on an external stand-in keyed by the type that **declares** the method —
+  `Vec::push`, `str::trim`, `Clone::clone`, and `Iterator::collect` for every
+  concrete iterator (`Range`, `Lines`, `Chars`) that answers through the
+  trait — which is all that is known about it. A
   receiver whose type nothing states — an unbounded generic, the result of
   a foreign function no table knows — is **counted, never guessed**, and
   the ledger edge says which hop stopped it.

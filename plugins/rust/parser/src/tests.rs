@@ -1514,6 +1514,46 @@ impl Meters {
     every_edge_has_endpoints(&a);
 }
 
+/// A std method is keyed by the type that declares it, not by the receiver.
+///
+/// `Range` declares no `collect` — it *is* an `Iterator`, and `Iterator`
+/// declares it. Keyed by the receiver, one method scattered into a node per
+/// concrete iterator the tree happened to build, and "who calls
+/// `Iterator::map`?" answered with a fraction of them.
+#[test]
+fn std_iterator_methods_are_keyed_by_the_trait_that_declares_them() {
+    let t = Tree::new("iter-owner");
+    t.write("Cargo.toml", "[package]\nname = \"k\"\n").write(
+        "src/lib.rs",
+        r#"
+pub fn over_a_range() -> usize {
+    let r = 0..10;
+    let doubled: Vec<usize> = r.map(|n| n * 2).collect();
+    doubled.len()
+}
+
+pub fn over_chars(s: String) -> usize {
+    let c = s.chars();
+    c.count()
+}
+"#,
+    );
+    let a = run(&t);
+    let called: Vec<&str> = a
+        .edges
+        .iter()
+        .filter(|e| e.ty == "CALLS" && e.src.starts_with("k::over_"))
+        .map(|e| e.dst.as_str())
+        .collect();
+    for one in ["Iterator::map", "Iterator::collect", "Iterator::count"] {
+        assert!(called.contains(&one), "{called:?}");
+    }
+    for scattered in ["Range::map", "Range::collect", "Chars::count"] {
+        assert!(!called.contains(&scattered), "{called:?}");
+        assert!(!keys(&a).contains(&scattered), "minted `{scattered}`");
+    }
+}
+
 // ---- P0 eval harness: known resolution gaps, un-ignored as their phase
 // lands. `just eval` runs these; CI's normal `cargo test` skips them.
 
