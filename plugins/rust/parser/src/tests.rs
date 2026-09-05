@@ -1427,6 +1427,93 @@ fn has_edge(a: &Assembled, src: &str, ty: &str, dst: &str) -> bool {
         .any(|e| e.src == src && e.ty == ty && e.dst == dst)
 }
 
+/// Every variant a body builds, as `(type key, variant)`.
+fn built(a: &Assembled, src: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = a
+        .edges
+        .iter()
+        .filter(|e| e.src == src && e.ty == "INSTANTIATES")
+        .map(|e| {
+            let variant = e.props.get("variant").and_then(text_of).unwrap_or_default();
+            (e.dst.clone(), variant)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Building a value is not calling a function.
+///
+/// `Ok(v)`, `Mine::A(v)` and `Meters(1.0)` are all spelled like calls and
+/// none of them is one; read as calls they put `Function` nodes named `Ok`
+/// and `Mine::A` in the graph, while the enum those names belong to sat in it
+/// unlinked. Each is an `INSTANTIATES` edge to the type built, with the
+/// variant on the edge — so "who builds a `Mine`?" is one hop, and a
+/// constructor that is not an item gets no node of its own.
+#[test]
+fn constructing_a_value_is_instantiation_not_a_call() {
+    let t = Tree::new("ctor-instantiate");
+    t.write("Cargo.toml", "[package]\nname = \"k\"\n").write(
+        "src/lib.rs",
+        r#"
+pub enum Mine { A(i64), B { x: i64 }, C }
+pub struct Meters(pub f64);
+pub struct Named { pub x: i64 }
+
+pub fn build(n: i64) -> Result<Option<Mine>, String> {
+    let _tuple_variant = Mine::A(n);
+    let _struct_variant = Mine::B { x: n };
+    let _tuple_struct = Meters(1.0);
+    let _struct_literal = Named { x: n };
+    let _external = std::num::Wrapping(n);
+    let _still_a_call = String::from("x");
+    Ok(Some(Mine::A(n)))
+}
+
+impl Meters {
+    pub fn zero() -> Self { Self(0.0) }
+}
+"#,
+    );
+    let a = run(&t);
+
+    assert_eq!(
+        built(&a, "k::build"),
+        vec![
+            ("Option".into(), "Some".into()),
+            ("Result".into(), "Ok".into()),
+            ("k::Meters".into(), String::new()),
+            ("k::Mine".into(), "A".into()),
+            ("k::Mine".into(), "B".into()),
+            ("k::Named".into(), String::new()),
+            ("std::num::Wrapping".into(), String::new()),
+        ],
+    );
+
+    // No node is invented for a constructor, and the prelude enums the
+    // constructions name become reachable instead.
+    let keys = keys(&a);
+    for phantom in ["Ok", "Some", "Mine::A", "Mine::B", "Meters"] {
+        assert!(!keys.contains(&phantom), "invented a node for `{phantom}`");
+    }
+    assert!(
+        keys.contains(&"Result") && keys.contains(&"Option"),
+        "{keys:?}"
+    );
+
+    // `Self` names the impl's type. Left as written it would put one node
+    // called `Self` in the graph for every impl in the tree.
+    assert_eq!(
+        built(&a, "k::Meters::zero"),
+        vec![("k::Meters".to_string(), String::new())],
+    );
+    assert!(!keys.contains(&"Self"), "minted a node for `Self`");
+
+    // A function that merely looks like a constructor is still a call.
+    assert!(has_edge(&a, "k::build", "CALLS", "String::from"));
+    every_edge_has_endpoints(&a);
+}
+
 // ---- P0 eval harness: known resolution gaps, un-ignored as their phase
 // lands. `just eval` runs these; CI's normal `cargo test` skips them.
 

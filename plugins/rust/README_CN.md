@@ -58,7 +58,9 @@ crate 名来自最近的 `Cargo.toml` 的 `[package] name`（`-` → `_`），�
 | `CALLS` | 函数 → 它调用的对象 | **调用处** |
 | `IMPLEMENTS` | 类型 → trait（`impl` 块）；`From<i64>` 作为边上的 `impl` 属性存在，而非另铸一个 `From` 节点 | `impl` 关键字 |
 | `IMPORTS` | 模块 → 其 `use` 语句命名的对象（有别名时带 `as_written`） | `use` 语句 |
+| `INSTANTIATES` | 函数 → 它**构造**的类型；构造的是枚举的变体时，`variant` 记在边上。构造不是调用：`Ok(v)`、`Mine::A(v)`、`Meters(1.0)`、`Widget { .. }` 都写得像调用或字面量，且都命名一个*类型*，因此不会为并非条目的构造器铸造 `Function` 节点 | 构造处 |
 | `INVOKES` | 模块 → 条目位置的宏调用，`arguments` described 在边上——一个**被标记的盲区**：没有任何东西展开宏，其定义的条目缺席，但定义发生之处可寻 | 调用处 |
+| `REFERENCES` | 函数 → 它**作为值传递**（而非调用）的函数 | 该实参 |
 
 ## 解析——确定性的界线
 

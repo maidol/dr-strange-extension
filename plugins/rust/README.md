@@ -62,7 +62,9 @@ carries `_code`: the source as written, described as retrieval-only — the
 | `CALLS` | function → what it calls | **call site** |
 | `IMPLEMENTS` | type → trait (`impl` blocks); `From<i64>` rides the edge as an `impl` prop rather than minting a second `From` node | the `impl` keyword |
 | `IMPORTS` | module → what its `use` statements name (with `as_written` when aliased) | the `use` statement |
+| `INSTANTIATES` | function → a type it **builds**, with `variant` on the edge when it built one of an enum's. Construction is not a call: `Ok(v)`, `Mine::A(v)`, `Meters(1.0)` and `Widget { .. }` are all spelled like calls or literals and all name a *type*, so none of them mints a `Function` node for a constructor that is no item | construction site |
 | `INVOKES` | module → an item-position macro invocation, `arguments` described on the edge — a **marked blind spot**: nothing expands macros, so the items they define are absent, but where they are defined is findable | invocation site |
+| `REFERENCES` | function → a function it **passes as a value** rather than calls | the argument |
 
 ## Resolution — the certainty line
 

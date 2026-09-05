@@ -153,6 +153,11 @@ pub struct FileFacts {
     /// `(enum key, variant, fields as (name or position, type as written))`
     /// — what a `Variant(x)` or `Variant { x }` pattern binds.
     variant_fields: Vec<(String, String, VariantFields)>,
+    /// Keys of structs declared with unnamed fields — `struct Meters(f64)`.
+    /// A tuple struct is the one type whose *name* is also callable, so
+    /// `Meters(1.0)` reads as a call and is a construction; knowing which
+    /// names those are is what keeps it from becoming a phantom function.
+    tuple_structs: Vec<String>,
     /// `(alias key, its type parameters, target type as written)` for every
     /// `type A<T> = B<T, …>;` — a name for its target, which is what a
     /// method call on it needs, with the parameters a use site fills in.
@@ -497,6 +502,9 @@ fn walk_items(items: &[syn::Item], parent: &str, include_source: bool, f: &mut F
                 // Plain-path field types, machine-readable: what types
                 // `o.field.m()` when the receiver walks a field.
                 let key = format!("{parent}::{}", s.ident);
+                if matches!(s.fields, syn::Fields::Unnamed(_)) {
+                    f.tuple_structs.push(key.clone());
+                }
                 for (i, field) in s.fields.iter().enumerate() {
                     if let Some(t) = written_ty(&field.ty) {
                         let name = field
@@ -1810,8 +1818,11 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
     // Every key declared anywhere, so a path written out in full can be matched
     // exactly rather than by its last segment.
     let mut declared: BTreeSet<String> = BTreeSet::new();
+    // The struct names that are also callable — see [`FileFacts::tuple_structs`].
+    let mut tuple_structs: BTreeSet<String> = BTreeSet::new();
     for f in &files {
         scopes.extend(f.scopes.iter().map(|(k, v)| (k.clone(), v.clone())));
+        tuple_structs.extend(f.tuple_structs.iter().cloned());
         for n in &f.nodes {
             declared.insert(n.key.clone());
             let Some(simple) = n.key.rsplit("::").next() else {
@@ -2426,6 +2437,103 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
         impls_of: &impls_of,
         trait_impl_methods: &trait_impl_methods,
     };
+    // Making a value is not calling a function. `Ok(v)`, `Mine::A(v)`,
+    // `Meters(1.0)` and `Wrapping(n)` all read as calls, and every one of
+    // them constructs a type — the graph said `CALLS` to an invented
+    // `Function` node named `Ok`, while the enum it names sat in the graph
+    // unlinked. Every construction resolves to the *type*, with the variant
+    // on the edge, so "who builds a `Mine`?" is one hop and no node is
+    // fabricated for a constructor that is not an item.
+    // A path nothing here declares is read by its casing, which is all that
+    // is left to read — so the doubtful case stays a call: minting a node is
+    // the more expensive way to be wrong.
+    let construction_of = |p: &str, caller: &str, module: &str| -> Option<Construction> {
+        // The prelude four. They are variants like any other, and naming
+        // their enum is what makes `Result` and `Option` reachable at all.
+        if let Some(e) = match p {
+            "Ok" | "Err" => Some("Result"),
+            "Some" | "None" => Some("Option"),
+            _ => None,
+        } {
+            return Some(Construction::variant_of(e, p, true));
+        }
+        // `Self` names the type this impl is for, and nothing else. Left as
+        // written it would mint a node called `Self` shared by every impl in
+        // the tree — so it resolves against the caller's owner or not at all.
+        let resolved;
+        let p = match p == "Self" || p.starts_with("Self::") {
+            false => p,
+            true => {
+                let owner = owner_of(caller).filter(|o| declared.contains(o))?;
+                resolved = p.replacen("Self", &owner, 1);
+                resolved.as_str()
+            }
+        };
+        let (owner, leaf) = match p.rsplit_once("::") {
+            Some((o, l)) => (Some(o), l),
+            None => (None, p),
+        };
+        // Only a type-cased last segment can name a constructor: `Vec::new`
+        // and `String::from` are functions.
+        if !leaf.starts_with(|c: char| c.is_uppercase()) {
+            return None;
+        }
+        // A declared enum's variant, when the segment before the leaf names
+        // one — including a variant a `use Mine::A` brought into scope, which
+        // arrives here already expanded back to `Mine::A`.
+        if let Some(owner) = owner {
+            let enum_key = if declared.contains(owner) {
+                Some(owner.to_string())
+            } else {
+                resolve_relative(owner, module, &aliases, &declared).or_else(|| {
+                    types
+                        .get(owner.rsplit("::").next().unwrap_or(owner))
+                        .and_then(|c| pick_in_scope(module, c, &scopes))
+                        .cloned()
+                })
+            };
+            if let Some(enum_key) = enum_key
+                && variant_map.contains_key(&(enum_key.clone(), leaf.to_string()))
+            {
+                return Some(Construction::variant_of(&enum_key, leaf, false));
+            }
+        }
+        // A declared tuple struct called by its own name.
+        let whole = if declared.contains(p) {
+            Some(p.to_string())
+        } else {
+            resolve_relative(p, module, &aliases, &declared).or_else(|| {
+                types
+                    .get(leaf)
+                    .and_then(|c| pick_in_scope(module, c, &scopes))
+                    .cloned()
+            })
+        };
+        if let Some(key) = whole {
+            return tuple_structs
+                .contains(&key)
+                .then(|| Construction::whole(&key, false));
+        }
+        // Nothing here declares it, so casing is all that is left to read —
+        // and `SCREAMING` is a constant, not a type. Being wrong here mints a
+        // node, so the doubtful case stays a call.
+        if !leaf.contains(char::is_lowercase) {
+            return None;
+        }
+        // A type-cased segment before the leaf makes the leaf that type's
+        // variant — `Ordering::Less`; otherwise the whole path is the type —
+        // `std::num::Wrapping`.
+        match owner.and_then(|o| o.rsplit("::").next().map(|s| (o, s))) {
+            Some((owner, last)) if last.starts_with(|c: char| c.is_uppercase()) => {
+                Some(Construction::variant_of(owner, leaf, true))
+            }
+            _ => Some(Construction::whole(p, true)),
+        }
+    };
+    // One INSTANTIATES edge per (caller, type, variant): a body that builds
+    // two variants of one enum states two facts, not one.
+    let mut inst_seen: BTreeSet<(String, String, String)> = BTreeSet::new();
+
     // Or why not: the reason the ledger edge carries.
     let typed_target =
         |caller: &str, call: &Call| -> Result<(String, &'static str, &'static str), String> {
@@ -2494,6 +2602,21 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
         };
 
         if let Some(p) = &call.path {
+            // Construction first: `Ok(v)` and `Meters(1.0)` are spelled like
+            // calls and are not calls, and reading them as one is what put a
+            // `Function` named `Ok` in the graph.
+            let module = scopes.get(&caller).cloned().unwrap_or_default();
+            if let Some(built) = construction_of(p, &caller, &module) {
+                emit_instantiation(
+                    &mut out.edges,
+                    &mut external,
+                    &mut inst_seen,
+                    &caller,
+                    &built,
+                    call.line,
+                );
+                continue;
+            }
             // A path written out in full names its target exactly, which beats
             // matching on a last segment two functions may share.
             if declared.contains(p) {
@@ -2585,28 +2708,33 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
         );
     }
     // Struct literals: a `Widget { .. }` uses the type as surely as a call
-    // uses a function — resolved the same way, emitted as INSTANTIATES.
-    let mut inst_seen: BTreeSet<(String, String)> = BTreeSet::new();
+    // uses a function — resolved the same way, emitted as INSTANTIATES. A
+    // `Mine::B { .. }` is the same act on an enum, and points at the enum.
     for (caller, p, line) in pending_insts {
         let module = scopes.get(&caller).cloned().unwrap_or_default();
-        let target = if declared.contains(&p) {
-            Some(p.clone())
+        let found = if declared.contains(&p) {
+            Some(Construction::whole(&p, false))
         } else if let Some(hit) = resolve_relative(&p, &module, &aliases, &declared) {
+            Some(Construction::whole(&hit, false))
+        } else if let Some(hit) = construction_of(&p, &caller, &module) {
             Some(hit)
         } else if p.contains("::") {
-            note_external(&mut external, &p, Some("Struct"));
-            Some(p.clone())
+            Some(Construction::whole(&p, true))
         } else {
             types
                 .get(&p)
                 .and_then(|cands| pick_in_scope(&module, cands, &scopes))
-                .cloned()
+                .map(|k| Construction::whole(k, false))
         };
-        if let Some(target) = target
-            && inst_seen.insert((caller.clone(), target.clone()))
-        {
-            out.edges
-                .push(edge_at(&caller, &target, "INSTANTIATES", line));
+        if let Some(built) = found {
+            emit_instantiation(
+                &mut out.edges,
+                &mut external,
+                &mut inst_seen,
+                &caller,
+                &built,
+                line,
+            );
         }
     }
 
@@ -4282,6 +4410,84 @@ fn node(
 ///
 /// Order-independent by construction: a kind, once known, replaces no-kind and
 /// nothing else, so which pass ran first cannot change the result.
+/// One construction, as an `INSTANTIATES` edge to the type built — the
+/// variant named on the edge rather than as a node, because a variant is not
+/// an item: it has no body, no signature and nothing to say beyond which
+/// shape of its enum this site chose. The enum node already carries them all
+/// under `variants`.
+///
+/// A type nothing here declares gets a node minted for it, labelled by what
+/// the construction proves: a path with a variant is an enum, a path called
+/// by its own name is a struct.
+/// One construction site's target: the type built, which of its variants
+/// when it is an enum's, and whether the type is nobody's declaration here
+/// and so needs a node minted for it.
+struct Construction {
+    target: String,
+    variant: Option<String>,
+    external: bool,
+}
+
+impl Construction {
+    /// The type itself — a struct literal, or a tuple struct by its own name.
+    fn whole(target: &str, external: bool) -> Self {
+        Self {
+            target: target.to_string(),
+            variant: None,
+            external,
+        }
+    }
+
+    /// One variant of an enum, named as the site wrote it.
+    fn variant_of(target: &str, variant: &str, external: bool) -> Self {
+        Self {
+            target: target.to_string(),
+            variant: Some(variant.rsplit("::").next().unwrap_or(variant).to_string()),
+            external,
+        }
+    }
+}
+
+fn emit_instantiation(
+    edges: &mut Vec<Edge>,
+    external: &mut BTreeMap<String, Node>,
+    seen: &mut BTreeSet<(String, String, String)>,
+    caller: &str,
+    built: &Construction,
+    line: u64,
+) {
+    let Construction {
+        target,
+        variant,
+        external: is_external,
+    } = built;
+    if !seen.insert((
+        caller.to_string(),
+        target.clone(),
+        variant.clone().unwrap_or_default(),
+    )) {
+        return;
+    }
+    if *is_external {
+        note_external(
+            external,
+            target,
+            Some(if variant.is_some() { "Enum" } else { "Struct" }),
+        );
+    }
+    let mut e = edge_at(caller, target, "INSTANTIATES", line);
+    if let Some(variant) = variant {
+        e.props.insert(
+            "variant".into(),
+            json!({
+                "$desc": "which of the enum's variants this site built",
+                "$value": variant,
+            }),
+        );
+    }
+    edges.push(e);
+}
+
 fn note_external(external: &mut BTreeMap<String, Node>, key: &str, kind: Option<&str>) {
     match external.get_mut(key) {
         Some(existing) if existing.extra_labels.is_empty() && kind.is_some() => {
