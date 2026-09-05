@@ -10,7 +10,7 @@
 ## 目录结构
 
 ```
-parser/     drsg-c-parser——语言逻辑，17 个原生测试
+parser/     drsg-c-parser——语言逻辑，25 个原生测试
 component/  drsg-plugin-c——Guest 实现 + rmp-serde 部分结果（构建需要 wasi-sdk）
 ```
 
@@ -53,6 +53,7 @@ stdio.h                               <system> 头：外部 File
 | `CONTAINS` | 文件 → 其声明；原型被定义合并时移到定义处 | 声明/定义处 |
 | `CALLS` | 函数 → 被调者（裸名字——见解析） | 调用处 |
 | `IMPORTS` | 文件 → 被 include 的文件：`#include "x.h"` 先同目录、再全树内无歧义的尾部匹配——include 路径是解析器不掌握的构建配置，歧义即计数；`<system>` include 指向外部 File 节点 | `#include` 处 |
+| `USES_TYPE` | 声明 → 为其**定型**的类型；`role` 记在边上（`field`、`param`、`return`）。绑定沿用链接器模型，与调用一致：先看本文件自己的声明，再看全树唯一的那个；被多个文件定义的名字只计数，绝不猜测。基本类型不指称任何可声明的类型，不属于任何边 | — |
 
 ## 解析——链接器的模型，就近优先
 
@@ -74,6 +75,23 @@ stdio.h                               <system> 头：外部 File
 调用 · libc 调用 · 无法解析的 include · 合并的声明 · 各自成立的多处定义
 名字。
 
+## 测试代码
+
+"谁调用了它"这个问题，测试代码与生产代码给出的答案分量不同；分不清两者的读者
+会把一个测试算作一个使用者。两条属性说明此事：`test_flag` 记录**依据是什么**，
+`_test_flag_confidence` 记录**该依据有多少分量**——下划线前缀使后者不进入紧凑
+渲染，也不进入向量，那里它只会是噪声；`cypher`、`get_node` 与 `export` 仍会返
+回它，而衡量此标记的读者正是在那里查看。源码中没有写下依据时，不作任何标记。
+
+| `test_flag` | `_test_flag_confidence` | 依据 |
+|---|---|---|
+| `framework-include` | `circumstantial` | 该文件包含测试框架头文件（`unity.h`、`cmocka.h`、`check.h`、`CUnit/…`、`criterion/…`、`greatest.h`、`munit.h` 等） |
+
+C 是这里唯一没有自有标记的语言：没有 `#[test]`，没有 `_test.go` 构建规则，也
+没有 `@Test`。头文件包含是唯一真正写下来的证据，它覆盖的是**文件**而非其中某个
+函数——正是 C 自己使用的作用域——并且它坦承自己只是旁证。`test_` 文件名只是一
+条无人强制的约定，**不**构成证据：不含框架头文件的 `test_helpers.c` 不会被标记。
+
 ## 选项（`[plugins.c]`）
 
 | 键 | 效果 |
@@ -83,7 +101,7 @@ stdio.h                               <system> 头：外部 File
 ## 构建与测试
 
 ```console
-$ cd parser && cargo test             # 17 个测试
+$ cd parser && cargo test             # 25 个测试
 $ just c-plugin                       # 需要 wasi-sdk；WASI_SDK 环境变量可覆盖
 $ drsg plugin install component/target/wasm32-wasip2/release/drsg_plugin_c.wasm
 ```

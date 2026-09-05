@@ -232,6 +232,10 @@ func Assemble(all []FileFacts) Assembled {
 		callRecv string
 		callName string
 	}
+	// One type position a declaration writes down, before it is known whether
+	// the type it names is one this tree declares.
+	type typeUse struct{ owner, target, role, name string }
+	var typeUses []typeUse
 	returns := map[string]string{} // callable key → first-result type key
 	locals := map[string]binding{} // caller\x00name
 	pkgVars := map[string]binding{}
@@ -250,6 +254,11 @@ func Assemble(all []FileFacts) Assembled {
 				return target + "." + name
 			}
 			return ""
+		}
+		for _, r := range f.TypeRefs {
+			if tk := resolveType(r.Alias, r.Type); tk != "" {
+				typeUses = append(typeUses, typeUse{owner: r.Owner, target: tk, role: r.Role, name: r.Name})
+			}
 		}
 		for _, r := range f.Returns {
 			key := f.PkgPath + "." + r.Name
@@ -644,6 +653,61 @@ func Assemble(all []FileFacts) Assembled {
 
 	// Ledger nodes join `seen` before the implied pass — they are edge
 	// targets, and the implied pass would otherwise mint bare doubles.
+	// A declared type is a dependency as surely as a call is. Until this
+	// existed, asking what a type's change would break saw only who built one
+	// — never who takes it as a parameter, returns it, or holds it in a field.
+	//
+	// Only types this tree declares get an edge, and the check has to happen
+	// here, before the implied-node pass below: an edge to a name nothing
+	// declares would mint a bare `Type` node for every `string` in the tree.
+	declaredType := map[string]bool{}
+	for _, n := range out.Nodes {
+		switch n.Label {
+		case "Struct", "Interface", "Type", "TypeAlias":
+			declaredType[n.Key] = true
+		}
+	}
+	type useKey struct{ src, dst string }
+	useRoles := map[useKey]map[string]bool{}
+	useNames := map[useKey]string{}
+	var useOrder []useKey
+	foreignTypeRefs := 0
+	for _, u := range typeUses {
+		if !declaredType[u.target] {
+			foreignTypeRefs++
+			continue
+		}
+		// A type that mentions itself is a real shape and a useless edge.
+		if u.target == u.owner {
+			continue
+		}
+		if _, ok := seen[u.owner]; !ok {
+			continue
+		}
+		k := useKey{u.owner, u.target}
+		if useRoles[k] == nil {
+			useRoles[k] = map[string]bool{}
+			useNames[k] = u.name
+			useOrder = append(useOrder, k)
+		}
+		useRoles[k][u.role] = true
+	}
+	for _, k := range useOrder {
+		roles := make([]string, 0, len(useRoles[k]))
+		for r := range useRoles[k] {
+			roles = append(roles, r)
+		}
+		sort.Strings(roles)
+		props := Props{"role": map[string]any{
+			"$desc":  "the type position this declaration names the type in",
+			"$value": strings.Join(roles, ", "),
+		}}
+		if useNames[k] != "" {
+			props["name"] = useNames[k]
+		}
+		addEdge(Edge{Src: k.src, Dst: k.dst, Type: "USES_TYPE", Props: props})
+	}
+
 	ledgerKeys := make([]string, 0, len(unresolvedNodes))
 	for k := range unresolvedNodes {
 		ledgerKeys = append(ledgerKeys, k)
@@ -708,6 +772,11 @@ func Assemble(all []FileFacts) Assembled {
 	if goroutines > 0 {
 		out.Notes = append(out.Notes, fmt.Sprintf(
 			"%d call(s) started with `go`, marked `concurrent` on the CALLS edge", goroutines))
+	}
+	if len(useOrder) > 0 || foreignTypeRefs > 0 {
+		out.Notes = append(out.Notes, fmt.Sprintf(
+			"%d type reference(s) recorded as `USES_TYPE` — what a declaration's fields, parameters and results are typed by; %d more name types this tree does not declare and are left as written text on the node",
+			len(useOrder), foreignTypeRefs))
 	}
 	if dupes > 0 {
 		out.Notes = append(out.Notes, fmt.Sprintf(

@@ -10,7 +10,7 @@ language-neutral better than a second Rust plugin ever could.
 ## Layout
 
 ```
-parser/     the language logic, plain Go, 29 native tests (go test — no TinyGo)
+parser/     the language logic, plain Go, 45 native tests (go test — no TinyGo)
 component/  the TinyGo wrapper over sdk/go, plus the wit/ build package
 ```
 
@@ -56,6 +56,7 @@ node it could only be a key collision, and its calls are wiring, not API.
 | `IMPLEMENTS` | type → interface — **no line**, deliberately: satisfaction is structural in Go; nothing is written anywhere |
 | `SENDS` | function → a channel it writes to (`ch <- v`) | the send |
 | `RECEIVES` | function → a channel it reads from (`<-ch`, `range ch`, a `select` case) | the receive |
+| `USES_TYPE` | declaration → a type it is **typed by**, `role` on the edge (`field`, `param`, `return`) and the union when one pair is written twice. Walked through slices, maps, channels and generic arguments — where [typeRef] stops, because a `[]Job` depends on `Job` even though its methods are not `Job`'s. In-tree types only | — |
 
 ## Resolution — the certainty line
 
@@ -93,6 +94,27 @@ node it could only be a key collision, and its calls are wiring, not API.
 - Same name in two files of one package = **build-tag variants**: first
   seen kept, counted.
 
+## Test code
+
+Test code answers "who calls this" differently from production code, and a
+reader that cannot tell them apart counts a test as a user. Two properties
+say so: `test_flag` carries **what the evidence was**, and
+`_test_flag_confidence` carries **how much that evidence is worth** — the `_`
+keeps the second out of the compact renderers and out of embeddings, where it
+would be noise; `cypher`, `get_node` and `export` still return it, which is
+where a reader weighing the flag is looking. Nothing is flagged when nothing
+is written down.
+
+| `test_flag` | `_test_flag_confidence` | From |
+|---|---|---|
+| `build-rule` | `definitive` | the file's name ends `_test.go` |
+
+Not a convention: the go tool compiles `_test.go` only under `go test`, so
+nothing such a file declares can be reached by a production binary — which is
+the stronger claim, and the one that makes "is this still used" answerable.
+The package is the exception, as it is for `file`: a package holding one test
+file is not a test package, and flagging it would say it was.
+
 ## Options (`[plugins.go]`)
 
 | Key | Effect |
@@ -102,7 +124,7 @@ node it could only be a key collision, and its calls are wiring, not API.
 ## Build & test
 
 ```console
-$ cd parser && go test ./...          # 29 tests, plain Go
+$ cd parser && go test ./...          # 45 tests, plain Go
 $ just go-plugin                      # → component/go.wasm
 $ drsg plugin install component/go.wasm
 ```

@@ -12,7 +12,7 @@ to infer is exactly what this refuses to guess.
 ## Layout
 
 ```
-parser/     drsg-ts-parser — the language logic, 30 native tests
+parser/     drsg-ts-parser — the language logic, 43 native tests
 component/  drsg-plugin-ts — Guest impl + rmp-serde partials
 ```
 
@@ -58,6 +58,7 @@ function boot` → `….boot`, reachable as `default`), else `default`.
 | `IMPORTS` | module → module (relative) or → external package (bare specifier) | import statement |
 | `REFERENCES` | fn → a function it **passes as a value** rather than calls; carries `concurrent: scheduled` when a scheduler was handed the function itself | the argument |
 | `IMPLEMENTS` / `EXTENDS` | `class C implements I` / class→class, interface→interface — **syntactic** in TS, so certain where Go's structural check could not be | class/interface declaration |
+| `USES_TYPE` | declaration → a type it is **typed by**, `role` on the edge (`field`, `param`, `return`). Array elements, unions and generic arguments are walked — `Job[]` is a dependency on `Job`. **Only where an annotation was written**: an unannotated parameter states no type, and its silence is not the absence of a dependency | — |
 
 ## Resolution — the certainty line
 
@@ -95,6 +96,27 @@ function boot` → `….boot`, reachable as `default`), else `default`.
 Report notes: unresolved member calls · external calls · import specifiers
 naming files the digest never saw (assets, styles) · merged declarations.
 
+## Test code
+
+Test code answers "who calls this" differently from production code, and a
+reader that cannot tell them apart counts a test as a user. Two properties
+say so: `test_flag` carries **what the evidence was**, and
+`_test_flag_confidence` carries **how much that evidence is worth** — the `_`
+keeps the second out of the compact renderers and out of embeddings, where it
+would be noise; `cypher`, `get_node` and `export` still return it, which is
+where a reader weighing the flag is looking. Nothing is flagged when nothing
+is written down.
+
+| `test_flag` | `_test_flag_confidence` | From |
+|---|---|---|
+| `filename` | `strong` | `*.test.*`, `*.spec.*`, or any path under `__tests__/` |
+
+`strong` and not `definitive` because a jest/vitest config can redraw the
+patterns, and a parser does not read build configuration. `describe`/`it`
+would be the other candidate and are worse evidence: the runners inject them
+as globals, so they arrive as unresolved calls, and a module that merely
+*defines* a function called `it` would read the same.
+
 ## Options (`[plugins.ts]`)
 
 | Key | Effect |
@@ -104,7 +126,7 @@ naming files the digest never saw (assets, styles) · merged declarations.
 ## Build & test
 
 ```console
-$ cd parser && cargo test             # 30 tests
+$ cd parser && cargo test             # 43 tests
 $ just ts-plugin
 $ drsg plugin install component/target/wasm32-wasip2/release/drsg_plugin_ts.wasm
 ```

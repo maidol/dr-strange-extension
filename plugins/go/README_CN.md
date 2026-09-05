@@ -9,7 +9,7 @@ Go 编写：它比第二个 Rust 插件更能证明契约是语言中立的。
 ## 目录结构
 
 ```
-parser/     语言逻辑，纯 Go，29 个原生测试（go test——与 TinyGo 无关）
+parser/     语言逻辑，纯 Go，45 个原生测试（go test——与 TinyGo 无关）
 component/  基于 sdk/go 的 TinyGo 封装，附 wit/ 构建包
 ```
 
@@ -53,6 +53,7 @@ example.com/demo/sub.Counter.Add      方法——path.Type.Method
 | `IMPLEMENTS` | 类型 → 接口——**特意无行号**：Go 的实现关系是结构性的，哪里都没写下来 |
 | `SENDS` | 函数 → 它写入的通道（`ch <- v`） | 发送处 |
 | `RECEIVES` | 函数 → 它读取的通道（`<-ch`、`range ch`、`select` 分支） | 接收处 |
+| `USES_TYPE` | 声明 → 为其**定型**的类型；`role` 记在边上（`field`、`param`、`return`），同一对写了多次则取并集。会走入切片、映射、通道与泛型参数——[typeRef] 在此止步，但 `[]Job` 确实依赖 `Job`，尽管其方法并不属于 `Job`。仅限本树声明的类型 | — |
 
 ## 解析——确定性的界线
 
@@ -80,6 +81,23 @@ example.com/demo/sub.Counter.Add      方法——path.Type.Method
   隐含出一个裸 `Type` 节点，而不是指向虚无的边。
 - 同包两个文件出现同名 = **build-tag 变体**：先见者留，计数。
 
+## 测试代码
+
+"谁调用了它"这个问题，测试代码与生产代码给出的答案分量不同；分不清两者的读者
+会把一个测试算作一个使用者。两条属性说明此事：`test_flag` 记录**依据是什么**，
+`_test_flag_confidence` 记录**该依据有多少分量**——下划线前缀使后者不进入紧凑
+渲染，也不进入向量，那里它只会是噪声；`cypher`、`get_node` 与 `export` 仍会返
+回它，而衡量此标记的读者正是在那里查看。源码中没有写下依据时，不作任何标记。
+
+| `test_flag` | `_test_flag_confidence` | 依据 |
+|---|---|---|
+| `build-rule` | `definitive` | 文件名以 `_test.go` 结尾 |
+
+这不是约定：go 工具只在 `go test` 下编译 `_test.go`，因此该文件声明的任何东西
+都不可能被生产二进制触及——这是更强的论断，也正是它让"这东西还有人用吗"可以
+被回答。包是例外，与 `file` 属性同理：含有一个测试文件的包并不是测试包，标记它
+就等于这样宣称。
+
 ## 选项（`[plugins.go]`）
 
 | 键 | 效果 |
@@ -89,7 +107,7 @@ example.com/demo/sub.Counter.Add      方法——path.Type.Method
 ## 构建与测试
 
 ```console
-$ cd parser && go test ./...          # 29 个测试，纯 Go
+$ cd parser && go test ./...          # 45 个测试，纯 Go
 $ just go-plugin                      # → component/go.wasm
 $ drsg plugin install component/go.wasm
 ```

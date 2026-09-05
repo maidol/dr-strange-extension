@@ -142,6 +142,21 @@ type Ret struct {
 	TypeName  string `json:"type_name"`
 }
 
+// TypeRef is one type position a declaration writes down — a struct field, a
+// parameter, a result — resolved in [Assemble] into a `USES_TYPE` edge when
+// it names a type this tree declares.
+//
+// Alias is the package qualifier as written, so it resolves through the
+// file's own import table like every other reference.
+type TypeRef struct {
+	Owner string `json:"owner"`
+	Role  string `json:"role"`
+	Name  string `json:"name,omitempty"`
+	Alias string `json:"alias,omitempty"`
+	Type  string `json:"type"`
+	Line  int    `json:"line,omitempty"`
+}
+
 // Embed records a struct's embedded field, for method-set promotion: a call
 // on the outer type may resolve to a method the embedded type declares.
 type Embed struct {
@@ -218,6 +233,8 @@ type FileFacts struct {
 	// ChanParams are the channel-typed parameters each function declares —
 	// where a caller's channel arrives under a new name.
 	ChanParams []ChanParam `json:"chan_params,omitempty"`
+	// TypeRefs are the type positions this file's declarations write down.
+	TypeRefs []TypeRef `json:"type_refs,omitempty"`
 	// Call sites too dynamic to name at all — `f()()`, chained selectors —
 	// counted so the notes can account for them.
 	Opaque int `json:"opaque,omitempty"`
@@ -371,12 +388,49 @@ func walkFile(file, pkgPath string, f *ast.File, fset *token.FileSet, src []byte
 	// Every declaration in this walk came from this file, so the file lands
 	// on each node in one place. The package is the exception: it *spans*
 	// files, and a single file+line on it would be an arbitrary pick.
+	//
+	// Test-ness rides along for the same reason and with the same exception:
+	// `_test.go` is the toolchain's own rule, not a convention, so every
+	// declaration in this file is test code — but a package holding one test
+	// file is not a test package, and flagging it would say it was.
+	testFile := isTestFile(file)
 	for i := range facts.Nodes {
-		if facts.Nodes[i].Label != "Package" {
-			facts.Nodes[i].Props["file"] = file
+		if facts.Nodes[i].Label == "Package" {
+			continue
+		}
+		facts.Nodes[i].Props["file"] = file
+		if testFile {
+			setTestFlag(facts.Nodes[i].Props, "build-rule", testFileDesc, "definitive")
 		}
 	}
 	return facts
+}
+
+// isTestFile reports Go's own build rule: a file whose name ends `_test.go`
+// is compiled only by `go test`, never into the package's production build.
+// That is stronger than a naming convention and stronger than "looks like a
+// test" — nothing this file declares can be reached by a production binary.
+func isTestFile(path string) bool {
+	base := path
+	if i := strings.LastIndex(base, "/"); i >= 0 {
+		base = base[i+1:]
+	}
+	return strings.HasSuffix(base, "_test.go")
+}
+
+const testFileDesc = "test code: `_test.go`, which the go tool compiles only under `go test` and never into the production build"
+
+// setTestFlag marks a node as test code: what the evidence was, and — in the
+// companion `_` property the renderers keep out of sight and the embedder out
+// of its vectors — how much that evidence is worth. Two properties rather
+// than one because the second is for a reader weighing the first, not for
+// display.
+func setTestFlag(props Props, kind, desc, confidence string) {
+	props["test_flag"] = map[string]any{
+		"$desc":  desc,
+		"$value": kind,
+	}
+	props["_test_flag_confidence"] = confidence
 }
 
 type walker struct {
@@ -429,6 +483,20 @@ func (w *walker) funcDecl(d *ast.FuncDecl) {
 
 	// Receiver-typing inputs: the declared first result (what `x := f()`
 	// makes x), the typed parameters, and the body's own stated bindings.
+	if d.Type.Results != nil {
+		for _, r := range d.Type.Results.List {
+			w.typeRefs(key, "return", "", r.Type, w.line(d))
+		}
+	}
+	if d.Type.Params != nil {
+		for _, field := range d.Type.Params.List {
+			pname := ""
+			if len(field.Names) > 0 {
+				pname = field.Names[0].Name
+			}
+			w.typeRefs(key, "param", pname, field.Type, w.line(d))
+		}
+	}
 	if d.Type.Results != nil && len(d.Type.Results.List) > 0 {
 		if alias, tname, ok := typeRef(d.Type.Results.List[0].Type); ok {
 			recv := ""
@@ -519,6 +587,15 @@ func (w *walker) typeSpec(d *ast.GenDecl, s *ast.TypeSpec) {
 			}
 		}
 		props := w.props("", doc, name)
+		if t.Fields != nil {
+			for _, field := range t.Fields.List {
+				fname := embeddedName(field.Type)
+				if len(field.Names) > 0 {
+					fname = field.Names[0].Name
+				}
+				w.typeRefs(key, "field", fname, field.Type, w.line(field))
+			}
+		}
 		if fields := w.fieldList(t.Fields); len(fields) > 0 {
 			props["fields"] = map[string]any{
 				"$desc":  "the fields it declares, each with its type as written",
@@ -821,6 +898,75 @@ func typeRef(e ast.Expr) (alias, name string, ok bool) {
 		}
 	}
 	return "", "", false
+}
+
+// typeNames reads every named type a type expression mentions, outermost
+// first: `map[string]*Job` yields `string` and `Job`, `chan Event` yields
+// `Event`, `Cache[Key, Job]` yields all three.
+//
+// Where [typeRef] stops — a slice's, map's or channel's methods belong to
+// other types entirely, so receiver typing must not walk in — a *dependency*
+// does not: holding a `[]Job` depends on `Job` as surely as holding one does,
+// and that is the fact `USES_TYPE` records.
+func typeNames(e ast.Expr) []TypeRef {
+	var out []TypeRef
+	var walk func(ast.Expr)
+	walk = func(e ast.Expr) {
+		switch t := e.(type) {
+		case *ast.StarExpr:
+			walk(t.X)
+		case *ast.ParenExpr:
+			walk(t.X)
+		case *ast.Ellipsis:
+			walk(t.Elt)
+		case *ast.ArrayType:
+			walk(t.Elt)
+		case *ast.MapType:
+			walk(t.Key)
+			walk(t.Value)
+		case *ast.ChanType:
+			walk(t.Value)
+		case *ast.IndexExpr:
+			walk(t.X)
+			walk(t.Index)
+		case *ast.IndexListExpr:
+			walk(t.X)
+			for _, i := range t.Indices {
+				walk(i)
+			}
+		case *ast.FuncType:
+			for _, l := range []*ast.FieldList{t.Params, t.Results} {
+				if l == nil {
+					continue
+				}
+				for _, f := range l.List {
+					walk(f.Type)
+				}
+			}
+		case *ast.StructType:
+			if t.Fields != nil {
+				for _, f := range t.Fields.List {
+					walk(f.Type)
+				}
+			}
+		case *ast.Ident:
+			out = append(out, TypeRef{Type: t.Name})
+		case *ast.SelectorExpr:
+			if x, ok := t.X.(*ast.Ident); ok {
+				out = append(out, TypeRef{Alias: x.Name, Type: t.Sel.Name})
+			}
+		}
+	}
+	walk(e)
+	return out
+}
+
+// typeRefs records every named type `e` mentions as one position of `owner`.
+func (w *walker) typeRefs(owner, role, name string, e ast.Expr, line int) {
+	for _, r := range typeNames(e) {
+		r.Owner, r.Role, r.Name, r.Line = owner, role, name, line
+		w.facts.TypeRefs = append(w.facts.TypeRefs, r)
+	}
 }
 
 // initHint reads an initializer expression: a composite literal names its

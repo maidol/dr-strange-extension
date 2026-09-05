@@ -12,7 +12,7 @@ independent of the release tag.
 ## Layout
 
 ```
-parser/     drsg-rust-parser — the language logic, a plain library, 37 native tests
+parser/     drsg-rust-parser — the language logic, a plain library, 71 native tests
 component/  drsg-plugin-rust — the wasm wrapper: Guest impl + rmp-serde partials
 ```
 
@@ -65,6 +65,7 @@ carries `_code`: the source as written, described as retrieval-only — the
 | `INSTANTIATES` | function → a type it **builds**, with `variant` on the edge when it built one of an enum's. Construction is not a call: `Ok(v)`, `Mine::A(v)`, `Meters(1.0)` and `Widget { .. }` are all spelled like calls or literals and all name a *type*, so none of them mints a `Function` node for a constructor that is no item | construction site |
 | `INVOKES` | module → an item-position macro invocation, `arguments` described on the edge — a **marked blind spot**: nothing expands macros, so the items they define are absent, but where they are defined is findable | invocation site |
 | `REFERENCES` | function → a function it **passes as a value** rather than calls | the argument |
+| `USES_TYPE` | declaration → a type it is **typed by**, `role` on the edge saying which position (`field`, `param`, `return`, `variant`, `alias`) and the union of them when one pair is written twice. Generic arguments are walked — `mpsc::Sender<Job>` is a dependency on `Job` — and only types this tree declares get an edge; a foreign one stays text in `signature`/`fields`. Never a self-loop | — |
 
 ## Resolution — the certainty line
 
@@ -109,6 +110,34 @@ carries `_code`: the source as written, described as retrieval-only — the
 Every count lands in the report notes, so a thin graph explains itself:
 unresolved method calls, external calls, ambiguous names, unexpanded macro
 invocations.
+
+## Test code
+
+Test code answers "who calls this" differently from production code, and a
+reader that cannot tell them apart counts a test as a user. Two properties
+say so: `test_flag` carries **what the evidence was**, and
+`_test_flag_confidence` carries **how much that evidence is worth** — the `_`
+keeps the second out of the compact renderers and out of embeddings, where it
+would be noise; `cypher`, `get_node` and `export` still return it, which is
+where a reader weighing the flag is looking. Nothing is flagged when nothing
+is written down.
+
+| `test_flag` | `_test_flag_confidence` | From |
+|---|---|---|
+| `attribute` | `definitive` | a `#[test]`-family attribute — the bare one, a runtime's own (`#[tokio::test]`, `#[async_std::test]`), `#[bench]`, `#[rstest]` |
+| `build-rule` | `definitive` | inside a `#[cfg(test)]` module, or a file under `tests/` / `benches/` |
+
+Both are cargo's rule rather than a convention: a `#[cfg(test)]` module is
+compiled out of the library, and `tests/`/`benches/` are targets of their own
+that never link into it. Both are *scopes*, so they reach the `impl` blocks
+written inside them, whose methods are keyed only at assemble. First writer
+wins, and the narrowest rule runs first: a `#[test]` fn inside a
+`#[cfg(test)]` module keeps `attribute`. The cfg is read as tokens, not text,
+which settles both traps — `cfg(feature = "test")` carries a string and not
+the identifier, and `cfg(not(test))` has its group skipped. A
+`#[cfg(test)] mod tests;` whose body is another *file* is flagged only if
+that file is itself under a flagged scope: which module declared it is not
+known until assemble.
 
 ## Options (`[plugins.rust]` in drsg.toml)
 

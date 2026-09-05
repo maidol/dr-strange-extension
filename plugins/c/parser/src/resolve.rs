@@ -426,6 +426,75 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
 
     out.edges = pending;
 
+    // A declared type is a dependency as surely as a call is. C states this
+    // in the one place it states anything about types: the declaration.
+    //
+    // Binding follows the same nearest-first model as calls, because it is
+    // the same question — which `foo` is this? The caller's own file first
+    // (a file-local type shadows a global of the same name), then the one
+    // definition the tree holds, then a unique declaration; a name several
+    // files define is counted, never guessed, since which one links is build
+    // configuration a parser does not have. Primitives never get here: they
+    // name no declarable type and the parser drops them at the source.
+    let type_keys: BTreeSet<&str> = out
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.label.as_str(), "Struct" | "Union" | "Enum" | "TypeAlias"))
+        .map(|n| n.key.as_str())
+        .collect();
+    let a_type = |key: &String| -> bool { type_keys.contains(key.as_str()) };
+    let mut uses: BTreeMap<(String, String), (BTreeSet<String>, String)> = BTreeMap::new();
+    let mut foreign_type_refs = 0usize;
+    for f in &all {
+        if f.failed {
+            continue;
+        }
+        let file_key = crate::file_key(&f.file);
+        for r in &f.type_refs {
+            let target = own
+                .get(&file_key)
+                .and_then(|m| m.get(&r.written))
+                .filter(|k| a_type(k))
+                .or_else(|| match defs.get(&r.written).map(Vec::as_slice) {
+                    Some([one]) if a_type(one) => Some(one),
+                    _ => None,
+                })
+                .or_else(|| match decls_only.get(&r.written).map(Vec::as_slice) {
+                    Some([one]) if a_type(one) => Some(one),
+                    _ => None,
+                });
+            let Some(target) = target else {
+                foreign_type_refs += 1;
+                continue;
+            };
+            // A type that mentions itself — `struct node { struct node *next; }`
+            // — is a real shape and a useless edge.
+            if *target == r.owner {
+                continue;
+            }
+            let slot = uses
+                .entry((r.owner.clone(), target.clone()))
+                .or_insert_with(|| (BTreeSet::new(), r.name.clone()));
+            slot.0.insert(r.role.clone());
+        }
+    }
+    let type_ref_edges = uses.len();
+    for ((owner, target), (roles, name)) in uses {
+        let mut e = edge_at(&owner, &target, "USES_TYPE", 0);
+        e.props.remove("line");
+        e.props.insert(
+            "role".into(),
+            serde_json::json!({
+                "$desc": "the type position this declaration names the type in",
+                "$value": roles.iter().cloned().collect::<Vec<_>>().join(", "),
+            }),
+        );
+        if !name.is_empty() {
+            e.props.insert("name".into(), Value::String(name));
+        }
+        out.edges.push(e);
+    }
+
     // ---- implied and external nodes --------------------------------------
     let mut implied: BTreeSet<String> = BTreeSet::new();
     for e in &out.edges {
@@ -490,6 +559,14 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
         out.notes.push(format!(
             "{multiply_defined} name(s) defined in more than one file — kept \
              apart, one node per defining file"
+        ));
+    }
+    if type_ref_edges > 0 || foreign_type_refs > 0 {
+        out.notes.push(format!(
+            "{type_ref_edges} type reference(s) recorded as `USES_TYPE` — what a \
+             declaration's fields, parameters and return are typed by; \
+             {foreign_type_refs} more name a type this tree does not declare \
+             (a library's, or one several files define) and are left as text"
         ));
     }
     out

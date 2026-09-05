@@ -11,7 +11,7 @@ checker——checker 才能推断的东西，正是这里拒绝去猜的东西�
 ## 目录结构
 
 ```
-parser/     drsg-ts-parser——语言逻辑，30 个原生测试
+parser/     drsg-ts-parser——语言逻辑，43 个原生测试
 component/  drsg-plugin-ts——Guest 实现 + rmp-serde 部分结果
 ```
 
@@ -56,6 +56,7 @@ acme/src/api.Client.connect           类成员
 | `IMPORTS` | 模块 → 模块（相对）或 → 外部包（裸 specifier） | import 语句 |
 | `REFERENCES` | 函数 → 它**作为值传递**（而非调用）的函数；调度器拿到的若是函数本身，则带 `concurrent: scheduled` | 该实参 |
 | `IMPLEMENTS` / `EXTENDS` | `class C implements I` / 类→类、接口→接口——TS 里是**句法**，因此确定，Go 的结构性检查做不到这一点 | 类/接口声明 |
+| `USES_TYPE` | 声明 → 为其**定型**的类型；`role` 记在边上（`field`、`param`、`return`）。数组元素、联合类型与泛型参数都会被走入——`Job[]` 就是对 `Job` 的依赖。**仅在写下了注解处**：未加注解的参数不陈述任何类型，其沉默并不等于没有依赖 | — |
 
 ## 解析——确定性的界线
 
@@ -86,6 +87,23 @@ acme/src/api.Client.connect           类成员
 报告注记：未解析的成员调用 · 外部调用 · 指向本次未见文件的 specifier
 （资源、样式）· 合并的声明。
 
+## 测试代码
+
+"谁调用了它"这个问题，测试代码与生产代码给出的答案分量不同；分不清两者的读者
+会把一个测试算作一个使用者。两条属性说明此事：`test_flag` 记录**依据是什么**，
+`_test_flag_confidence` 记录**该依据有多少分量**——下划线前缀使后者不进入紧凑
+渲染，也不进入向量，那里它只会是噪声；`cypher`、`get_node` 与 `export` 仍会返
+回它，而衡量此标记的读者正是在那里查看。源码中没有写下依据时，不作任何标记。
+
+| `test_flag` | `_test_flag_confidence` | 依据 |
+|---|---|---|
+| `filename` | `strong` | `*.test.*`、`*.spec.*`，或位于 `__tests__/` 之下 |
+
+是 `strong` 而非 `definitive`，因为 jest/vitest 的配置可以改写这些模式，而解析
+器不读构建配置。`describe`/`it` 是另一个候选依据，但更弱：运行器把它们作为全局
+量注入，因而只会以未解析调用的形式出现，而一个仅仅**定义**了名为 `it` 的函数的
+模块看起来完全一样。
+
 ## 选项（`[plugins.ts]`）
 
 | 键 | 效果 |
@@ -95,7 +113,7 @@ acme/src/api.Client.connect           类成员
 ## 构建与测试
 
 ```console
-$ cd parser && cargo test             # 30 个测试
+$ cd parser && cargo test             # 43 个测试
 $ just ts-plugin
 $ drsg plugin install component/target/wasm32-wasip2/release/drsg_plugin_ts.wasm
 ```

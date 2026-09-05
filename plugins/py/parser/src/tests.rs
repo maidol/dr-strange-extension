@@ -795,3 +795,135 @@ async def produce():
         a.nodes.iter().map(|n| &n.key).collect::<Vec<_>>()
     );
 }
+
+/// Two rules, ranked: a filename is what the runners collect by default and
+/// a config file can move it, so it is `strong`; a `unittest.TestCase`
+/// subclass is unittest's own definition of a test, so it is `definitive`
+/// and overwrites the weaker flag on the class it covers.
+#[test]
+fn test_code_is_flagged_by_filename_and_by_unittest_base() {
+    let a = run(&tree(vec![
+        ("pkg/__init__.py", ""),
+        ("pkg/svc.py", "def helper():\n    return 1\n"),
+        (
+            "pkg/test_svc.py",
+            "from pkg.svc import helper\n\ndef test_helper():\n    assert helper()\n",
+        ),
+        (
+            "pkg/cases.py",
+            "import unittest as ut\nfrom unittest import TestCase as TC\n\nclass Direct(ut.TestCase):\n    def test_one(self):\n        pass\n\nclass Aliased(TC):\n    def test_two(self):\n        pass\n\nclass NotATest:\n    def run(self):\n        pass\n",
+        ),
+        (
+            "pkg/decoy.py",
+            "class TestCase:\n    pass\n\nclass Mine(TestCase):\n    def go(self):\n        pass\n",
+        ),
+    ]));
+
+    // Filename evidence covers the module and everything in it.
+    for key in ["pkg.test_svc", "pkg.test_svc.test_helper"] {
+        assert_eq!(
+            node(&a, key).props["test_flag"]["$value"],
+            Value::from("filename")
+        );
+        assert_eq!(
+            node(&a, key).props["_test_flag_confidence"],
+            Value::from("strong")
+        );
+    }
+
+    // Base-class evidence covers the class and its methods, in a file whose
+    // name says nothing.
+    for key in [
+        "pkg.cases.Direct",
+        "pkg.cases.Direct.test_one",
+        "pkg.cases.Aliased",
+        "pkg.cases.Aliased.test_two",
+    ] {
+        assert_eq!(
+            node(&a, key).props["test_flag"]["$value"],
+            Value::from("base-class"),
+            "{key}"
+        );
+        assert_eq!(
+            node(&a, key).props["_test_flag_confidence"],
+            Value::from("definitive"),
+            "{key}"
+        );
+    }
+
+    // A local class named TestCase is somebody else's TestCase.
+    for key in [
+        "pkg.svc",
+        "pkg.svc.helper",
+        "pkg.cases.NotATest",
+        "pkg.decoy.Mine",
+    ] {
+        assert!(
+            !node(&a, key).props.contains_key("test_flag"),
+            "{key} must not be flagged"
+        );
+    }
+}
+
+/// A declared type is a dependency as surely as a call is — where Python
+/// wrote the annotation. Fields, parameters and returns say so, through
+/// subscripts and unions, folded to one edge per pair.
+#[test]
+fn annotated_types_become_uses_type_edges() {
+    let a = run(&tree(vec![
+        ("pkg/__init__.py", ""),
+        ("pkg/job.py", "class Job:\n    pass\n"),
+        ("pkg/cfg.py", "class Cfg:\n    pass\n"),
+        (
+            "pkg/pool.py",
+            "from pkg.job import Job\nfrom pkg.cfg import Cfg\n\nclass Pool:\n    queue: list[Job]\n    index: dict[str, Cfg]\n    label: str\n\ndef work(c: Cfg) -> Job:\n    return Job()\n\ndef round_trip(c: Cfg) -> Cfg:\n    return c\n\ndef loose(x):\n    return x\n",
+        ),
+    ]));
+
+    let role = |src: &str, dst: &str| -> Option<String> {
+        a.edges
+            .iter()
+            .find(|e| e.ty == "USES_TYPE" && e.src == src && e.dst == dst)
+            .map(|e| e.props["role"]["$value"].as_str().unwrap().to_string())
+    };
+
+    // Through a subscript, which is how annotated Python names a collection.
+    assert_eq!(
+        role("pkg.pool.Pool", "pkg.job.Job").as_deref(),
+        Some("field")
+    );
+    assert_eq!(
+        role("pkg.pool.Pool", "pkg.cfg.Cfg").as_deref(),
+        Some("field")
+    );
+    assert_eq!(
+        role("pkg.pool.work", "pkg.cfg.Cfg").as_deref(),
+        Some("param")
+    );
+    assert_eq!(
+        role("pkg.pool.work", "pkg.job.Job").as_deref(),
+        Some("return")
+    );
+    assert_eq!(
+        role("pkg.pool.round_trip", "pkg.cfg.Cfg").as_deref(),
+        Some("param, return")
+    );
+
+    // An unannotated parameter states no type — and no absence of one.
+    assert!(
+        !a.edges
+            .iter()
+            .any(|e| e.ty == "USES_TYPE" && e.src == "pkg.pool.loose"),
+        "nothing was written, so nothing is claimed"
+    );
+    for e in a.edges.iter().filter(|e| e.ty == "USES_TYPE") {
+        assert_ne!(e.src, e.dst, "never a self-loop");
+        for builtin in ["str", "list", "dict"] {
+            assert!(
+                !e.dst.ends_with(&format!(".{builtin}")),
+                "{} is a builtin and nobody's edge",
+                e.dst
+            );
+        }
+    }
+}

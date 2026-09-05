@@ -10,7 +10,7 @@ statements included) — parse-only: no inference.
 ## Layout
 
 ```
-parser/     drsg-py-parser — the language logic, 21 native tests
+parser/     drsg-py-parser — the language logic, 39 native tests
 component/  drsg-plugin-py — Guest impl + rmp-serde partials
 ```
 
@@ -52,6 +52,7 @@ the module declares one, else every name not underscore-prefixed.
 | `IMPORTS` | module → module (absolute target; relative imports resolved at parse, where the module is known) | import statement |
 | `REFERENCES` | function → a function it **passes as a value** rather than calls; carries `concurrent: scheduled` when a scheduler was handed the callable itself | the argument |
 | `EXTENDS` | class → base — syntax, with a subscripted base extending what it subscripts (`Generic[T]` → `typing.Generic`) | class line |
+| `USES_TYPE` | declaration → a type it is **annotated with**, `role` on the edge (`field`, `param`, `return`). Subscripts, unions and string forward references are walked — `list[Job]` is a dependency on `Job`. **Only where an annotation was written**: an unannotated parameter states no type, and its silence is not the absence of a dependency | — |
 
 ## Resolution — the certainty line
 
@@ -93,6 +94,30 @@ the module declares one, else every name not underscore-prefixed.
 Report notes: unresolved member/attribute calls · external calls · merged
 declarations.
 
+## Test code
+
+Test code answers "who calls this" differently from production code, and a
+reader that cannot tell them apart counts a test as a user. Two properties
+say so: `test_flag` carries **what the evidence was**, and
+`_test_flag_confidence` carries **how much that evidence is worth** — the `_`
+keeps the second out of the compact renderers and out of embeddings, where it
+would be noise; `cypher`, `get_node` and `export` still return it, which is
+where a reader weighing the flag is looking. Nothing is flagged when nothing
+is written down.
+
+| `test_flag` | `_test_flag_confidence` | From |
+|---|---|---|
+| `base-class` | `definitive` | a `unittest.TestCase` subclass (also `IsolatedAsyncioTestCase`, `FunctionTestCase`), through whatever name the file imported it under |
+| `filename` | `strong` | `test_*.py`, `*_test.py`, `conftest.py` |
+
+Ranked, so the strongest evidence is what remains: a filename is what the
+runners collect by *default* and `pyproject.toml` can move it, while a
+`TestCase` subclass is unittest's own definition of a test — so it overwrites
+the filename flag on the class it covers and on that class's methods. A bare
+`TestCase` base counts only when an import in the same file says it came from
+`unittest`; a local class of that name is somebody else's `TestCase`, and
+flagging its subclasses would call production code a test.
+
 ## Options (`[plugins.py]`)
 
 | Key | Effect |
@@ -102,7 +127,7 @@ declarations.
 ## Build & test
 
 ```console
-$ cd parser && cargo test             # 21 tests
+$ cd parser && cargo test             # 39 tests
 $ just py-plugin
 $ drsg plugin install component/target/wasm32-wasip2/release/drsg_plugin_py.wasm
 ```

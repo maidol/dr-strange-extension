@@ -823,6 +823,64 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
     }
     out.edges = pending_edges;
 
+    // A declared type is a dependency as surely as a call is. Until this
+    // existed, asking what a type's change would break saw only who
+    // constructed one — never who takes it as a parameter, returns it, or
+    // holds it in a field.
+    //
+    // `type_decl` resolves in-tree names only, which is the rule: a class
+    // outside this tree contributes nothing to follow. And it has to hold
+    // here, because the implied-node pass below mints a node for any endpoint
+    // nothing declares — an edge to `string` would put `string` in the graph.
+    let declared_types: BTreeSet<String> = out
+        .nodes
+        .iter()
+        .filter(|n| {
+            matches!(
+                n.label.as_str(),
+                "Class" | "Interface" | "TypeAlias" | "Enum"
+            )
+        })
+        .map(|n| n.key.clone())
+        .collect();
+    let mut uses: BTreeMap<(String, String), (BTreeSet<String>, String)> = BTreeMap::new();
+    let mut foreign_type_refs = 0usize;
+    for f in &all {
+        let bindings = file_bindings(f);
+        for r in &f.type_refs {
+            let Some(key) =
+                type_decl(f, &bindings, &r.written).filter(|k| declared_types.contains(k))
+            else {
+                foreign_type_refs += 1;
+                continue;
+            };
+            // A type that mentions itself is a real shape and a useless edge.
+            if key == r.owner {
+                continue;
+            }
+            let slot = uses
+                .entry((r.owner.clone(), key))
+                .or_insert_with(|| (BTreeSet::new(), r.name.clone()));
+            slot.0.insert(r.role.clone());
+        }
+    }
+    let type_ref_edges = uses.len();
+    for ((owner, target), (roles, name)) in uses {
+        let mut e = edge_at(&owner, &target, "USES_TYPE", 0);
+        e.props.remove("line");
+        e.props.insert(
+            "role".into(),
+            serde_json::json!({
+                "$desc": "the type position this declaration names the type in",
+                "$value": roles.iter().cloned().collect::<Vec<_>>().join(", "),
+            }),
+        );
+        if !name.is_empty() {
+            e.props.insert("name".into(), Value::String(name));
+        }
+        out.edges.push(e);
+    }
+
     // ---- implied and external nodes --------------------------------------
     // An edge into nothing is unwritable; what an edge proves exists gets a
     // bare node saying only that.
@@ -869,6 +927,14 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
         out.notes.push(format!(
             "{missed_specs} import specifier(s) named no file in this tree — \
              assets, or files the digest never saw"
+        ));
+    }
+    if type_ref_edges > 0 || foreign_type_refs > 0 {
+        out.notes.push(format!(
+            "{type_ref_edges} type reference(s) recorded as `USES_TYPE` — what a \
+             declaration's fields, parameters and returns are typed by, where an \
+             annotation was written; {foreign_type_refs} more name types this tree \
+             does not declare and are left as written text on the node"
         ));
     }
     if merged > 0 {

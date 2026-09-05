@@ -11,7 +11,7 @@ not expanded**.
 ## Layout
 
 ```
-parser/     drsg-c-parser — the language logic, 17 native tests
+parser/     drsg-c-parser — the language logic, 25 native tests
 component/  drsg-plugin-c — Guest impl + rmp-serde partials (needs wasi-sdk to build)
 ```
 
@@ -56,6 +56,7 @@ count — C documents in all three.
 | `CONTAINS` | file → its declarations; moves to the definition when one merges over a prototype | declaration/definition site |
 | `CALLS` | function → callee (bare names — see resolution) | call site |
 | `IMPORTS` | file → included file: `#include "x.h"` resolved same-directory first, then an unambiguous tail anywhere in the tree — include paths are build configuration a parser does not have, so ambiguity is counted; `<system>` includes point at external File nodes | the `#include` |
+| `USES_TYPE` | declaration → a type it is **typed by**, `role` on the edge (`field`, `param`, `return`). Binds by the linker's model, like calls: the file's own declaration first, then the one the tree holds; a name several files define is counted, never guessed. A primitive names no declarable type and is nobody's edge | — |
 
 ## Resolution — the linker's model, nearest first
 
@@ -82,6 +83,28 @@ Report notes: unresolved (pointers, unexpanded macros, absent libraries) ·
 calls to multiply-defined names left unbound · libc calls · unresolvable
 includes · merged declarations · multiply-defined names kept apart.
 
+## Test code
+
+Test code answers "who calls this" differently from production code, and a
+reader that cannot tell them apart counts a test as a user. Two properties
+say so: `test_flag` carries **what the evidence was**, and
+`_test_flag_confidence` carries **how much that evidence is worth** — the `_`
+keeps the second out of the compact renderers and out of embeddings, where it
+would be noise; `cypher`, `get_node` and `export` still return it, which is
+where a reader weighing the flag is looking. Nothing is flagged when nothing
+is written down.
+
+| `test_flag` | `_test_flag_confidence` | From |
+|---|---|---|
+| `framework-include` | `circumstantial` | the file includes a test framework's header (`unity.h`, `cmocka.h`, `check.h`, `CUnit/…`, `criterion/…`, `greatest.h`, `munit.h`, …) |
+
+C is the one language here with no marker of its own: no `#[test]`, no
+`_test.go` build rule, no `@Test`. The include is the only thing actually
+written down, it covers the *file* and not any one function — the scope C
+itself uses — and it is honest about being circumstantial. A `test_`
+filename is a convention with nothing enforcing it and is **not** evidence:
+`test_helpers.c` with no framework header stays unflagged.
+
 ## Options (`[plugins.c]`)
 
 | Key | Effect |
@@ -91,7 +114,7 @@ includes · merged declarations · multiply-defined names kept apart.
 ## Build & test
 
 ```console
-$ cd parser && cargo test             # 17 tests
+$ cd parser && cargo test             # 25 tests
 $ just c-plugin                       # needs wasi-sdk; WASI_SDK env overrides
 $ drsg plugin install component/target/wasm32-wasip2/release/drsg_plugin_c.wasm
 ```

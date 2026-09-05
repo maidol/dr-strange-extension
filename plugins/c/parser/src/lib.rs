@@ -68,6 +68,21 @@ pub struct Decl {
     pub is_static: bool,
 }
 
+/// One type position a declaration writes down — a struct field, a
+/// parameter, a return — resolved in [`assemble`] into a `USES_TYPE` edge
+/// when it names a type this tree declares.
+///
+/// `written` is the bare tag or typedef name: `struct foo *next` names
+/// `foo`, `Job j` names `Job`. A primitive names nothing and is never
+/// recorded — the same rule that keeps builtins out of the call graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeRef {
+    pub owner: String,
+    pub role: String,
+    pub name: String,
+    pub written: String,
+}
+
 /// One call site: C calls are bare names — anything reached through a
 /// value (function pointers, `ops->read()`) is a compiler's business.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +124,9 @@ pub struct FileFacts {
     pub opaque: usize,
     /// Function-pointer bindings the bodies state.
     pub hints: Vec<Hint>,
+    /// The type positions this file's declarations write down.
+    #[serde(default)]
+    pub type_refs: Vec<TypeRef>,
     /// `(caller, bare name, line)` — names passed as call arguments
     /// (`register_handler(my_cb)`, `&my_cb`); resolved to REFERENCES only
     /// when the name is an in-tree function.
@@ -166,6 +184,55 @@ fn file_key(path: &str) -> String {
     path.to_string()
 }
 
+/// Headers no translation unit includes unless it is a test.
+///
+/// C states no test-ness of its own: there is no `#[test]`, no `_test.go`
+/// build rule, no `@Test`. A `test_` prefix on a filename is a convention
+/// with nothing enforcing it, and this parser does not guess. The one thing
+/// actually written down is the framework header the file includes — which
+/// says the *file* is built against a test framework, and says nothing about
+/// which of its functions is a test. That is why the flag it sets is
+/// `circumstantial` where go's and rust's are `definitive`.
+const TEST_FRAMEWORK_HEADERS: &[&str] = &[
+    "unity.h",
+    "cmocka.h",
+    "check.h",
+    "greatest.h",
+    "munit.h",
+    "acutest.h",
+    "utest.h",
+    "minunit.h",
+    "tau.h",
+    "ctest.h",
+];
+
+/// Directories whose every header belongs to one framework.
+const TEST_FRAMEWORK_DIRS: &[&str] = &["CUnit/", "criterion/", "gtest/", "cmocka/"];
+
+fn is_test_framework_header(path: &str) -> bool {
+    let norm = path.replace('\\', "/");
+    if TEST_FRAMEWORK_DIRS.iter().any(|d| norm.starts_with(d)) {
+        return true;
+    }
+    let base = norm.rsplit('/').next().unwrap_or(norm.as_str());
+    TEST_FRAMEWORK_HEADERS.contains(&base)
+}
+
+/// Mark a node as test code: what the evidence was, and — in the companion
+/// `_` property the renderers keep out of sight and the embedder out of its
+/// vectors — how much that evidence is worth. Two properties rather than one
+/// because the second is for a reader weighing the first, not for display.
+fn set_test_flag(props: &mut Props, kind: &str, desc: &str, confidence: &str) {
+    props.insert(
+        "test_flag".into(),
+        serde_json::json!({ "$desc": desc, "$value": kind }),
+    );
+    props.insert(
+        "_test_flag_confidence".into(),
+        Value::String(confidence.into()),
+    );
+}
+
 fn parse_file(path: &str, text: &str, include_source: bool) -> FileFacts {
     let mut parser = tree_sitter::Parser::new();
     if parser
@@ -218,6 +285,22 @@ fn parse_file(path: &str, text: &str, include_source: bool) -> FileFacts {
     for n in facts.nodes.iter_mut().skip(1) {
         n.props
             .insert("file".into(), Value::String(path.to_string()));
+    }
+
+    // A framework header taints its whole translation unit, file node
+    // included: the file is the scope C itself uses, and it is the only
+    // scope this evidence covers.
+    if let Some(header) = facts
+        .includes
+        .iter()
+        .map(|(p, _, _)| p)
+        .find(|p| is_test_framework_header(p))
+        .cloned()
+    {
+        let desc = format!("test code: this file includes the test framework header `{header}`");
+        for n in facts.nodes.iter_mut() {
+            set_test_flag(&mut n.props, "framework-include", &desc, "circumstantial");
+        }
     }
     facts
 }
@@ -356,9 +439,40 @@ impl Walker<'_> {
             name,
         );
 
+        // The declared interface: what it is handed and what it hands back.
+        if let Some(t) = node.child_by_field_name("type") {
+            self.type_ref(&key, "return", "", t);
+        }
+        if let Some(params) = Self::parameter_list(declarator) {
+            let mut cursor = params.walk();
+            for p in params.named_children(&mut cursor) {
+                if p.kind() != "parameter_declaration" {
+                    continue;
+                }
+                let pname = p
+                    .named_children(&mut p.walk())
+                    .find_map(|d| self.declarator_name_field(d).map(|(n, _)| n))
+                    .unwrap_or_default();
+                if let Some(t) = p.child_by_field_name("type") {
+                    self.type_ref(&key, "param", &pname, t);
+                }
+            }
+        }
+
         if let Some(body) = node.child_by_field_name("body") {
             self.collect_calls(&key, body);
         }
+    }
+
+    /// The parameter list of a (possibly pointer-wrapped) declarator.
+    fn parameter_list(declarator: TsNode) -> Option<TsNode> {
+        if declarator.kind() == "function_declarator" {
+            return declarator.child_by_field_name("parameters");
+        }
+        let mut cursor = declarator.walk();
+        declarator
+            .named_children(&mut cursor)
+            .find_map(Self::parameter_list)
     }
 
     /// A top-level declaration: an extern function prototype, a global
@@ -480,6 +594,32 @@ impl Walker<'_> {
     }
 
     /// `struct foo { … }` / `enum bar { … }` — a named type with a body.
+    /// The type a type node names, when it names one this tree could
+    /// declare: a tag (`struct foo` → `foo`) or a typedef name. A primitive
+    /// (`int`, `unsigned long`, `void`) names nothing — nobody's edge, the
+    /// same call the call graph makes for builtins.
+    fn type_named(&self, node: TsNode) -> Option<String> {
+        match node.kind() {
+            "type_identifier" => Some(self.text(node)),
+            "struct_specifier" | "union_specifier" | "enum_specifier" => {
+                node.child_by_field_name("name").map(|n| self.text(n))
+            }
+            _ => None,
+        }
+    }
+
+    /// Record the type `node` names as one type position of `owner`.
+    fn type_ref(&mut self, owner: &str, role: &str, name: &str, node: TsNode) {
+        if let Some(written) = self.type_named(node) {
+            self.facts.type_refs.push(TypeRef {
+                owner: owner.to_string(),
+                role: role.to_string(),
+                name: name.to_string(),
+                written,
+            });
+        }
+    }
+
     fn record_type(&mut self, node: TsNode) {
         let Some(name_node) = node.child_by_field_name("name") else {
             return; // an anonymous struct is its typedef's business
@@ -542,6 +682,10 @@ impl Walker<'_> {
                                 | "function_declarator"
                         ) && let Some((fname, _)) = self.declarator_name_field(fd)
                         {
+                            if let Some(t) = m.child_by_field_name("type") {
+                                let owner = format!("{}::{name}", self.file_key);
+                                self.type_ref(&owner, "field", &fname, t);
+                            }
                             fields.push(format!("{fname}: {fty}"));
                         }
                     }

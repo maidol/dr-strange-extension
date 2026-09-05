@@ -1003,3 +1003,115 @@ func TestAPackageLevelChannelAdoptsItsDeclaration(t *testing.T) {
 		t.Fatalf("a package-level channel is in scope for the package: %v", a.Edges)
 	}
 }
+
+// `_test.go` is the go tool's own rule, not a convention: nothing such a
+// file declares is compiled into the production build. The package spans
+// both files and is not itself test code.
+func TestTestFilesAreFlaggedByTheBuildRule(t *testing.T) {
+	a := run(t, mapFiles{files: map[string]string{
+		"go.mod":     "module m\n",
+		"a.go":       "package m\n\nfunc Helper() {}\n",
+		"a_test.go":  "package m\n\nimport \"testing\"\n\nfunc TestHelper(t *testing.T) { Helper() }\n\ntype fixture struct{ n int }\n",
+		"nottest.go": "package m\n\nfunc LooksLikeTestNothing() {}\n",
+	}})
+
+	for _, key := range []string{"m.TestHelper", "m.fixture"} {
+		n := node(t, a, key)
+		flag, ok := n.Props["test_flag"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s carries no test_flag: %v", key, n.Props)
+		}
+		if flag["$value"] != "build-rule" {
+			t.Errorf("%s: got kind %v, want build-rule", key, flag["$value"])
+		}
+		if n.Props["_test_flag_confidence"] != "definitive" {
+			t.Errorf("%s: got confidence %v, want definitive", key, n.Props["_test_flag_confidence"])
+		}
+	}
+
+	for _, key := range []string{"m.Helper", "m.LooksLikeTestNothing"} {
+		if _, flagged := node(t, a, key).Props["test_flag"]; flagged {
+			t.Errorf("%s is production code and must not be flagged", key)
+		}
+	}
+
+	// The package holds one test file; that does not make the package a test.
+	if _, flagged := node(t, a, "m").Props["test_flag"]; flagged {
+		t.Error("a package spanning test and production files is not test code")
+	}
+}
+
+// A declared type is a dependency as surely as a call is: fields, parameters
+// and results say so, through slices, maps, pointers and channels alike —
+// folded to one edge per pair carrying the union of the positions.
+func TestDeclaredTypesBecomeUsesTypeEdges(t *testing.T) {
+	a := run(t, mapFiles{files: map[string]string{
+		"go.mod": "module m\n",
+		"a.go": "package m\n\n" +
+			"type Job struct{ ID int }\n\n" +
+			"type Cfg struct{ N int }\n\n" +
+			"type Pool struct {\n" +
+			"\tQueue []*Job\n" +
+			"\tIndex map[string]Cfg\n" +
+			"\tFeed  chan Job\n" +
+			"\tCount int\n" +
+			"}\n\n" +
+			"type Node struct{ Next *Node }\n\n" +
+			"func Work(c *Cfg) *Job { return nil }\n\n" +
+			"func RoundTrip(c Cfg) Cfg { return c }\n\n" +
+			"func Foreign(s string) error { return nil }\n",
+	}})
+
+	role := func(src, dst string) string {
+		for _, e := range a.Edges {
+			if e.Type == "USES_TYPE" && e.Src == src && e.Dst == dst {
+				if p, ok := e.Props["role"].(map[string]any); ok {
+					return p["$value"].(string)
+				}
+			}
+		}
+		return ""
+	}
+
+	// Fields, through a slice of pointers, a map value and a channel element.
+	if got := role("m.Pool", "m.Job"); got != "field" {
+		t.Errorf("Pool → Job: got %q, want field", got)
+	}
+	if got := role("m.Pool", "m.Cfg"); got != "field" {
+		t.Errorf("Pool → Cfg: got %q, want field", got)
+	}
+	// Parameter and result.
+	if got := role("m.Work", "m.Cfg"); got != "param" {
+		t.Errorf("Work → Cfg: got %q, want param", got)
+	}
+	if got := role("m.Work", "m.Job"); got != "return" {
+		t.Errorf("Work → Job: got %q, want return", got)
+	}
+	// One dependency written twice is one edge naming both positions.
+	if got := role("m.RoundTrip", "m.Cfg"); got != "param, return" {
+		t.Errorf("RoundTrip → Cfg: got %q, want \"param, return\"", got)
+	}
+
+	for _, e := range a.Edges {
+		if e.Type != "USES_TYPE" {
+			continue
+		}
+		if e.Src == e.Dst {
+			t.Errorf("never a self-loop, got %s → %s", e.Src, e.Dst)
+		}
+		// `string`, `int` and `error` are nobody's edge.
+		for _, foreign := range []string{"string", "int", "error"} {
+			if strings.HasSuffix(e.Dst, "."+foreign) {
+				t.Errorf("%s is not declared here and must not get an edge", e.Dst)
+			}
+		}
+	}
+	if _, flagged := nodeProps(t, a, "m.Node")["test_flag"]; flagged {
+		t.Error("unrelated: Node is not test code")
+	}
+}
+
+func nodeProps(t *testing.T, a Assembled, key string) Props {
+	t.Helper()
+	return node(t, a, key).Props
+}

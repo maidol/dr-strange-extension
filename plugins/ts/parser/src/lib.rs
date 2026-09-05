@@ -125,6 +125,20 @@ pub enum CallKind {
     FieldChain { obj: String, field: String },
 }
 
+/// One type position a declaration writes down — a field, a parameter, a
+/// return — resolved in [`assemble`] into a `USES_TYPE` edge when it names a
+/// type this tree declares.
+///
+/// Only where an annotation exists: this is a parse-only reader, so an
+/// unannotated parameter states no type and no absence of dependency.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeRef {
+    pub owner: String,
+    pub role: String,
+    pub name: String,
+    pub written: String,
+}
+
 /// How a name is bound to a class the source states — an annotation, a
 /// `new` expression, or a factory call whose declared return names it.
 /// `caller` is a function key for params and locals, a CLASS key for
@@ -208,6 +222,10 @@ pub struct FileFacts {
     pub classes: Vec<String>,
     /// Type bindings the source states (annotations, `new`, factories).
     pub hints: Vec<Hint>,
+    /// The type positions this file's declarations write down — only where
+    /// an annotation was written, which is all a parse-only reader has.
+    #[serde(default)]
+    pub type_refs: Vec<TypeRef>,
     /// `(caller, bare name, line)` — functions passed as call arguments.
     /// `(caller, line, bare name, scheduled)` — a function handed as a
     /// value. `setTimeout(tick)` schedules `tick` itself, which is a
@@ -457,7 +475,50 @@ fn parse_file(path: &str, package: &Package, text: &str, include_source: bool) -
         n.props
             .insert("file".into(), Value::String(path.to_string()));
     }
+
+    // What the runners collect by default. `describe`/`it` would be the
+    // other candidate and are worse evidence: jest and vitest inject them as
+    // globals, so they arrive as unresolved calls and a file that merely
+    // *defines* a function called `it` would read the same. The name is what
+    // is actually written down — and it is a default a jest/vitest config can
+    // move, which is why this is `strong` and not `definitive`.
+    if let Some(why) = test_path(path) {
+        for n in facts.nodes.iter_mut() {
+            set_test_flag(&mut n.props, "filename", &why, "strong");
+        }
+    }
     facts
+}
+
+/// `foo.test.ts`, `foo.spec.tsx`, or anything under a `__tests__` directory —
+/// the three shapes the JS test runners look for out of the box.
+fn test_path(path: &str) -> Option<String> {
+    let norm = path.replace('\\', "/");
+    if norm.split('/').any(|seg| seg == "__tests__") {
+        return Some(
+            "test code: under a `__tests__` directory, which the test runners collect by default"
+                .to_string(),
+        );
+    }
+    let base = norm.rsplit('/').next().unwrap_or(norm.as_str());
+    let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
+    (stem.ends_with(".test") || stem.ends_with(".spec"))
+        .then(|| format!("test code: `{base}` is a name the test runners collect by default"))
+}
+
+/// Mark a node as test code: what the evidence was, and — in the companion
+/// `_` property the renderers keep out of sight and the embedder out of its
+/// vectors — how much that evidence is worth. Two properties rather than one
+/// because the second is for a reader weighing the first, not for display.
+fn set_test_flag(props: &mut Props, kind: &str, desc: &str, confidence: &str) {
+    props.insert(
+        "test_flag".into(),
+        serde_json::json!({ "$desc": desc, "$value": kind }),
+    );
+    props.insert(
+        "_test_flag_confidence".into(),
+        Value::String(confidence.into()),
+    );
 }
 
 struct Walker<'a> {
@@ -775,6 +836,73 @@ impl Walker<'_> {
     /// one-level qualified name (`ns.Foo`). Generics and unions are a
     /// checker's business — except `Promise<T>`, whose `T` is what an
     /// async factory hands the awaiter.
+    /// Every named type an annotation mentions, outermost first:
+    /// `Map<string, Job[]>` yields `Map`, `string`, `Job`.
+    ///
+    /// Where [`Walker::type_written`] takes only the head and gives up on
+    /// generics — a receiver's methods are the head's — a *dependency* does
+    /// not: `jobs: Job[]` depends on `Job`, and that is the fact `USES_TYPE`
+    /// records.
+    fn type_names(t: &ast::TsType, out: &mut Vec<String>) {
+        match t {
+            ast::TsType::TsTypeRef(r) => {
+                let name = match &r.type_name {
+                    ast::TsEntityName::Ident(i) => Some(i.sym.to_string()),
+                    ast::TsEntityName::TsQualifiedName(q) => match &q.left {
+                        ast::TsEntityName::Ident(l) => Some(format!("{}.{}", l.sym, q.right.sym)),
+                        _ => None,
+                    },
+                };
+                if let Some(name) = name {
+                    out.push(name);
+                }
+                if let Some(args) = &r.type_params {
+                    for p in &args.params {
+                        Self::type_names(p, out);
+                    }
+                }
+            }
+            ast::TsType::TsArrayType(a) => Self::type_names(&a.elem_type, out),
+            ast::TsType::TsOptionalType(o) => Self::type_names(&o.type_ann, out),
+            ast::TsType::TsRestType(r) => Self::type_names(&r.type_ann, out),
+            ast::TsType::TsParenthesizedType(p) => Self::type_names(&p.type_ann, out),
+            ast::TsType::TsTypeOperator(o) => Self::type_names(&o.type_ann, out),
+            ast::TsType::TsTupleType(t) => {
+                for e in &t.elem_types {
+                    Self::type_names(&e.ty, out);
+                }
+            }
+            ast::TsType::TsUnionOrIntersectionType(u) => match u {
+                ast::TsUnionOrIntersectionType::TsUnionType(u) => {
+                    for t in &u.types {
+                        Self::type_names(t, out);
+                    }
+                }
+                ast::TsUnionOrIntersectionType::TsIntersectionType(i) => {
+                    for t in &i.types {
+                        Self::type_names(t, out);
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+
+    /// Record every named type an annotation mentions as one type position of
+    /// `owner`.
+    fn type_refs(&mut self, owner: &str, role: &str, name: &str, t: &ast::TsType) {
+        let mut names = Vec::new();
+        Self::type_names(t, &mut names);
+        for written in names {
+            self.facts.type_refs.push(TypeRef {
+                owner: owner.to_string(),
+                role: role.to_string(),
+                name: name.to_string(),
+                written,
+            });
+        }
+    }
+
     fn type_written(t: &ast::TsType) -> Option<String> {
         let ast::TsType::TsTypeRef(r) = t else {
             return None;
@@ -871,15 +999,19 @@ impl Walker<'_> {
         for param in &f.params {
             if let ast::Pat::Ident(b) = &param.pat
                 && let Some(ann) = &b.type_ann
-                && let Some(written) = Self::type_written(&ann.type_ann)
             {
-                self.hint(caller, b.id.sym.to_string(), written, false);
+                if let Some(written) = Self::type_written(&ann.type_ann) {
+                    self.hint(caller, b.id.sym.to_string(), written, false);
+                }
+                let pname = b.id.sym.to_string();
+                self.type_refs(caller, "param", &pname, &ann.type_ann);
             }
         }
-        if let Some(ret) = &f.return_type
-            && let Some(written) = Self::type_written(&ret.type_ann)
-        {
-            self.facts.returns.push((caller.to_string(), written));
+        if let Some(ret) = &f.return_type {
+            if let Some(written) = Self::type_written(&ret.type_ann) {
+                self.facts.returns.push((caller.to_string(), written));
+            }
+            self.type_refs(caller, "return", "", &ret.type_ann);
         }
         for (idx, args) in self.callback_sig(&f.params) {
             self.facts
@@ -1124,6 +1256,9 @@ impl Walker<'_> {
                     None => n.clone(),
                 };
                 // A declared property's class types `this.n.m()` chains.
+                if let Some(t) = &p.type_ann {
+                    self.type_refs(&key, "field", &n, &t.type_ann);
+                }
                 if let Some(t) = &p.type_ann
                     && let Some(written) = Self::type_written(&t.type_ann)
                 {

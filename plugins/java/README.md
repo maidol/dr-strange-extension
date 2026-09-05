@@ -11,7 +11,7 @@ C runtime and grammar compile to `wasm32-wasip2` under wasi-sdk's clang.
 ## Layout
 
 ```
-parser/     drsg-java-parser — the language logic, 18 native tests
+parser/     drsg-java-parser — the language logic, 25 native tests
 component/  drsg-plugin-java — Guest impl + rmp-serde partials (needs wasi-sdk to build)
 ```
 
@@ -46,6 +46,7 @@ com.acme.core.Engine.Builder          a nested type chains through the outer
 | `IMPORTS` | each of the file's top-level types → what the file imports (Java's import is file-scoped; the type is what a reader navigates by) | import statement |
 | `EXTENDS` / `IMPLEMENTS` | class → superclass / interfaces; interface → extended interfaces; generic bases extend what they subscript (`ArrayList<Double>` → `java.util.ArrayList`) | type declaration |
 | `ANNOTATED_BY` | type/method → its annotations — on a Spring codebase the annotations *are* the architecture (`@Service`, `@Transactional`, `@GetMapping`); `java.lang`'s own markers (`@Override`, `@Deprecated`, …) are noise and stay out | annotation site |
+| `USES_TYPE` | declaration → a type it is **typed by**, `role` on the edge (`field`, `param`, `return`), a record's components counted as fields. Generic arguments are walked — `List<Job>` is a dependency on `Job` — and only types this tree declares get an edge | — |
 
 ## Resolution — reading references the way javac does
 
@@ -66,6 +67,29 @@ imports**, resolved against what the tree actually holds → **`java.lang`**
 Report notes: unresolved value-receiver calls · external calls · merged
 declarations.
 
+## Test code
+
+Test code answers "who calls this" differently from production code, and a
+reader that cannot tell them apart counts a test as a user. Two properties
+say so: `test_flag` carries **what the evidence was**, and
+`_test_flag_confidence` carries **how much that evidence is worth** — the `_`
+keeps the second out of the compact renderers and out of embeddings, where it
+would be noise; `cypher`, `get_node` and `export` still return it, which is
+where a reader weighing the flag is looking. Nothing is flagged when nothing
+is written down.
+
+| `test_flag` | `_test_flag_confidence` | From |
+|---|---|---|
+| `annotation` | `definitive` | a JUnit/TestNG annotation — `@Test`, `@ParameterizedTest`, `@RepeatedTest`, `@TestFactory`, `@TestTemplate`, and the `@Before*`/`@After*` hooks |
+| `build-layout` | `strong` | under `src/test/java` |
+
+Ranked, so the strongest evidence is what remains: the source set is a layout
+Maven and Gradle both enforce and a build file can still redraw, while the
+annotation is JUnit's own definition of a test. It reaches the type holding
+the method as well as the method — a class with an `@Test` in it is a test
+class — so an annotated test in `src/main/java` is still flagged, and an
+unannotated helper in `src/test/java` keeps the weaker flag.
+
 ## Options (`[plugins.java]`)
 
 | Key | Effect |
@@ -75,7 +99,7 @@ declarations.
 ## Build & test
 
 ```console
-$ cd parser && cargo test             # 18 tests — native, the C grammar compiles for the host too
+$ cd parser && cargo test             # 25 tests — native, the C grammar compiles for the host too
 $ just java-plugin                    # needs wasi-sdk; WASI_SDK env overrides the default path
 $ drsg plugin install component/target/wasm32-wasip2/release/drsg_plugin_java.wasm
 ```

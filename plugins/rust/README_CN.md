@@ -10,7 +10,7 @@
 ## 目录结构
 
 ```
-parser/     drsg-rust-parser——语言逻辑，普通库，37 个原生测试
+parser/     drsg-rust-parser——语言逻辑，普通库，71 个原生测试
 component/  drsg-plugin-rust——wasm 封装：Guest 实现 + rmp-serde 部分结果
 ```
 
@@ -61,6 +61,7 @@ crate 名来自最近的 `Cargo.toml` 的 `[package] name`（`-` → `_`），�
 | `INSTANTIATES` | 函数 → 它**构造**的类型；构造的是枚举的变体时，`variant` 记在边上。构造不是调用：`Ok(v)`、`Mine::A(v)`、`Meters(1.0)`、`Widget { .. }` 都写得像调用或字面量，且都命名一个*类型*，因此不会为并非条目的构造器铸造 `Function` 节点 | 构造处 |
 | `INVOKES` | 模块 → 条目位置的宏调用，`arguments` described 在边上——一个**被标记的盲区**：没有任何东西展开宏，其定义的条目缺席，但定义发生之处可寻 | 调用处 |
 | `REFERENCES` | 函数 → 它**作为值传递**（而非调用）的函数 | 该实参 |
+| `USES_TYPE` | 声明 → 为其**定型**的类型；`role` 记在边上，说明是哪个位置（`field`、`param`、`return`、`variant`、`alias`），同一对写了多次则取并集。泛型参数会被走入——`mpsc::Sender<Job>` 就是对 `Job` 的依赖——且只有本树声明的类型才成边，外来类型仍以文本留在 `signature`/`fields` 中。绝不自环 | — |
 
 ## 解析——确定性的界线
 
@@ -98,6 +99,28 @@ crate 名来自最近的 `Cargo.toml` 的 `[package] name`（`-` → `_`），�
 每项计数都落入报告注记，让稀疏的图自己解释自己：未解析的方法调用、外部
 调用、歧义名字、未展开的宏调用。
 
+## 测试代码
+
+"谁调用了它"这个问题，测试代码与生产代码给出的答案分量不同；分不清两者的读者
+会把一个测试算作一个使用者。两条属性说明此事：`test_flag` 记录**依据是什么**，
+`_test_flag_confidence` 记录**该依据有多少分量**——下划线前缀使后者不进入紧凑
+渲染，也不进入向量，那里它只会是噪声；`cypher`、`get_node` 与 `export` 仍会返
+回它，而衡量此标记的读者正是在那里查看。源码中没有写下依据时，不作任何标记。
+
+| `test_flag` | `_test_flag_confidence` | 依据 |
+|---|---|---|
+| `attribute` | `definitive` | `#[test]` 一族属性——裸写的那个、运行时自己的（`#[tokio::test]`、`#[async_std::test]`）、`#[bench]`、`#[rstest]` |
+| `build-rule` | `definitive` | 位于 `#[cfg(test)]` 模块内，或位于 `tests/`、`benches/` 下的文件 |
+
+两者都是 cargo 的规则而非约定：`#[cfg(test)]` 模块会被编译出库之外，`tests/`
+与 `benches/` 是各自独立的目标，从不链接进库。两者都是**作用域**，因此也覆盖写
+在其中的 `impl` 块——这些块的方法要到 assemble 阶段才定键。先写者胜出，且更窄
+的规则先跑：`#[cfg(test)]` 模块内的 `#[test]` 函数保留 `attribute`。cfg 按 token
+读取而非按文本，这同时化解了两个陷阱——`cfg(feature = "test")` 携带的是字符串
+而非标识符，`cfg(not(test))` 的分组会被跳过。至于 `#[cfg(test)] mod tests;` 其
+主体在另一个**文件**中的情形，只有当该文件本身位于已标记的作用域内才会被标记：
+它由哪个模块声明，要到 assemble 才知道。
+
 ## 选项（drsg.toml 的 `[plugins.rust]`）
 
 | 键 | 效果 |
@@ -107,7 +130,7 @@ crate 名来自最近的 `Cargo.toml` 的 `[package] name`（`-` → `_`），�
 ## 构建与测试
 
 ```console
-$ cd parser    && cargo test          # 37 个测试，无需 wasm 工具链
+$ cd parser    && cargo test          # 71 个测试，无需 wasm 工具链
 $ just rust-plugin                    # → component/target/wasm32-wasip2/release/drsg_plugin_rust.wasm
 $ drsg plugin install …/drsg_plugin_rust.wasm
 ```

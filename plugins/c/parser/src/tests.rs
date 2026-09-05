@@ -551,3 +551,111 @@ fn functions_passed_as_values_become_references() {
             .any(|e| e.ty == "REFERENCES" && e.src == "m.c::wire" && e.dst.contains("count")),
     );
 }
+
+/// C has no test marker of its own, so the only written evidence is the
+/// framework header — file-scoped, and honest about being circumstantial. A
+/// filename that merely looks like a test is not evidence and must not flag.
+#[test]
+fn a_framework_header_flags_its_translation_unit_and_nothing_else() {
+    let a = run(vec![
+        ("lib.c", "int parse_len(const char *s) { return 3; }\n"),
+        (
+            "test_lib.c",
+            "#include <unity.h>\nextern int parse_len(const char *s);\nvoid test_parse_len(void) { parse_len(\"abc\"); }\n",
+        ),
+        (
+            "test_looks_like_one.c",
+            "extern int parse_len(const char *s);\nvoid test_nothing(void) { parse_len(\"x\"); }\n",
+        ),
+    ]);
+
+    for key in ["test_lib.c", "test_lib.c::test_parse_len"] {
+        assert_eq!(
+            node(&a, key).props["test_flag"]["$value"],
+            Value::from("framework-include"),
+            "{key} is in a unit that includes unity.h"
+        );
+        assert_eq!(
+            node(&a, key).props["_test_flag_confidence"],
+            Value::from("circumstantial"),
+        );
+        assert!(
+            node(&a, key).props["test_flag"]["$desc"]
+                .as_str()
+                .unwrap()
+                .contains("unity.h"),
+            "the description names the header the flag rests on"
+        );
+    }
+
+    for key in [
+        "lib.c",
+        "lib.c::parse_len",
+        "test_looks_like_one.c",
+        "test_looks_like_one.c::test_nothing",
+    ] {
+        assert!(
+            !node(&a, key).props.contains_key("test_flag"),
+            "{key} states no test-ness a parser can read"
+        );
+    }
+}
+
+/// A declared type is a dependency as surely as a call is — and in C the
+/// binding follows the linker's model, the way calls do: the file's own
+/// declaration first, then the one the tree holds. Primitives name no
+/// declarable type and are nobody's edge.
+#[test]
+fn declared_types_become_uses_type_edges() {
+    let a = run(vec![
+        (
+            "types.h",
+            "struct job { int id; };\ntypedef struct job Job;\nstruct cfg { int n; };\n",
+        ),
+        (
+            "pool.c",
+            "#include \"types.h\"\nstruct pool {\n\tstruct job *queue;\n\tstruct cfg conf;\n\tint count;\n\tchar *label;\n};\nstruct job *work(struct cfg *c) { return 0; }\nstruct cfg *round_trip(struct cfg *c) { return c; }\n",
+        ),
+        ("list.c", "struct node { struct node *next; };\n"),
+    ]);
+
+    let role = |src: &str, dst: &str| -> Option<String> {
+        a.edges
+            .iter()
+            .find(|e| e.ty == "USES_TYPE" && e.src == src && e.dst == dst)
+            .map(|e| e.props["role"]["$value"].as_str().unwrap().to_string())
+    };
+
+    assert_eq!(
+        role("pool.c::pool", "types.h::job").as_deref(),
+        Some("field")
+    );
+    assert_eq!(
+        role("pool.c::pool", "types.h::cfg").as_deref(),
+        Some("field")
+    );
+    assert_eq!(
+        role("pool.c::work", "types.h::cfg").as_deref(),
+        Some("param")
+    );
+    assert_eq!(
+        role("pool.c::work", "types.h::job").as_deref(),
+        Some("return")
+    );
+    assert_eq!(
+        role("pool.c::round_trip", "types.h::cfg").as_deref(),
+        Some("param, return"),
+        "one dependency, two positions, one edge"
+    );
+
+    for e in a.edges.iter().filter(|e| e.ty == "USES_TYPE") {
+        assert_ne!(e.src, e.dst, "never a self-loop");
+        for prim in ["int", "char", "void"] {
+            assert!(
+                !e.dst.ends_with(&format!("::{prim}")),
+                "{} is a primitive and must not get an edge",
+                e.dst
+            );
+        }
+    }
+}

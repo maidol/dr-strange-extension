@@ -781,6 +781,51 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
     }
     out.edges = pending;
 
+    // A declared type is a dependency as surely as a call is. Until this
+    // existed, asking what a type's change would break saw only who
+    // constructed one — never who takes it as a parameter, returns it, or
+    // holds it in a field.
+    //
+    // In-tree only, through the same `decl_of` the hints above use, and the
+    // check has to hold here: the implied-node pass below mints a node for
+    // any endpoint nothing declares, so an edge to `str` would put `str` in
+    // the graph.
+    let mut uses: BTreeMap<(String, String), (BTreeSet<String>, String)> = BTreeMap::new();
+    let mut foreign_type_refs = 0usize;
+    for f in &all {
+        let bindings = file_bindings(f);
+        for r in &f.type_refs {
+            let Some(key) = decl_of(f, &bindings, &r.written) else {
+                foreign_type_refs += 1;
+                continue;
+            };
+            // A type that mentions itself is a real shape and a useless edge.
+            if key == r.owner {
+                continue;
+            }
+            let slot = uses
+                .entry((r.owner.clone(), key))
+                .or_insert_with(|| (BTreeSet::new(), r.name.clone()));
+            slot.0.insert(r.role.clone());
+        }
+    }
+    let type_ref_edges = uses.len();
+    for ((owner, target), (roles, name)) in uses {
+        let mut e = edge_at(&owner, &target, "USES_TYPE", 0);
+        e.props.remove("line");
+        e.props.insert(
+            "role".into(),
+            json!({
+                "$desc": "the type position this declaration names the type in",
+                "$value": roles.iter().cloned().collect::<Vec<_>>().join(", "),
+            }),
+        );
+        if !name.is_empty() {
+            e.props.insert("name".into(), Value::String(name));
+        }
+        out.edges.push(e);
+    }
+
     // ---- implied and external nodes --------------------------------------
     let mut implied: BTreeSet<String> = BTreeSet::new();
     for e in &out.edges {
@@ -825,6 +870,14 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
         out.notes.push(format!(
             "{merged} declaration(s) shared a key across files — a stub beside \
              its module, or a name rebound; the first seen is kept"
+        ));
+    }
+    if type_ref_edges > 0 || foreign_type_refs > 0 {
+        out.notes.push(format!(
+            "{type_ref_edges} type reference(s) recorded as `USES_TYPE` — what a \
+             declaration's fields, parameters and returns are annotated with; \
+             {foreign_type_refs} more name types this tree does not declare and \
+             are left as written text on the node"
         ));
     }
     out

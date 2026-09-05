@@ -554,3 +554,139 @@ fn receiver_resolutions_are_stamped() {
         Some("receiver")
     );
 }
+
+/// Two rules, ranked: the source set Maven and Gradle compile apart is
+/// `strong`, and a JUnit annotation — which is JUnit's own definition of a
+/// test — is `definitive`, reaching the type that holds the method too.
+#[test]
+fn test_code_is_flagged_by_source_set_and_by_annotation() {
+    let a = run(vec![
+        (
+            "src/main/java/com/acme/Engine.java",
+            "package com.acme;\npublic class Engine {\n  public void start() {}\n}\n",
+        ),
+        (
+            "src/test/java/com/acme/EngineTest.java",
+            "package com.acme;\nimport org.junit.jupiter.api.Test;\npublic class EngineTest {\n  @Test\n  public void starts() {}\n  public void helper() {}\n}\n",
+        ),
+        (
+            "src/main/java/com/acme/OddlyPlaced.java",
+            "package com.acme;\nimport org.junit.jupiter.api.Test;\npublic class OddlyPlaced {\n  @Test\n  public void alsoATest() {}\n}\n",
+        ),
+    ]);
+
+    // Annotation wins over layout on the method and on its class.
+    for key in ["com.acme.EngineTest", "com.acme.EngineTest.starts"] {
+        assert_eq!(
+            node(&a, key).props["test_flag"]["$value"],
+            Value::from("annotation"),
+            "{key}"
+        );
+        assert_eq!(
+            node(&a, key).props["_test_flag_confidence"],
+            Value::from("definitive"),
+            "{key}"
+        );
+    }
+
+    // An unannotated helper in the test source set keeps the weaker flag.
+    assert_eq!(
+        node(&a, "com.acme.EngineTest.helper").props["test_flag"]["$value"],
+        Value::from("build-layout")
+    );
+    assert_eq!(
+        node(&a, "com.acme.EngineTest.helper").props["_test_flag_confidence"],
+        Value::from("strong")
+    );
+
+    // An annotated test in the main source set is still a test.
+    assert_eq!(
+        node(&a, "com.acme.OddlyPlaced.alsoATest").props["test_flag"]["$value"],
+        Value::from("annotation")
+    );
+
+    for key in ["com.acme.Engine", "com.acme.Engine.start"] {
+        assert!(
+            !node(&a, key).props.contains_key("test_flag"),
+            "{key} must not be flagged"
+        );
+    }
+}
+
+/// A declared type is a dependency as surely as a call is: fields (a record's
+/// components included), parameters and returns say so, through generic
+/// arguments, and folded to one edge per pair.
+#[test]
+fn declared_types_become_uses_type_edges() {
+    let a = run(vec![
+        (
+            "src/main/java/com/acme/Job.java",
+            "package com.acme;\npublic class Job {}\n",
+        ),
+        (
+            "src/main/java/com/acme/Cfg.java",
+            "package com.acme;\npublic class Cfg {}\n",
+        ),
+        (
+            "src/main/java/com/acme/Pool.java",
+            "package com.acme;\nimport java.util.List;\npublic class Pool {\n  private List<Job> queue;\n  private Cfg cfg;\n  private String label;\n  public Job work(Cfg c) { return null; }\n  public Cfg roundTrip(Cfg c) { return c; }\n}\n",
+        ),
+        (
+            "src/main/java/com/acme/Pair.java",
+            "package com.acme;\npublic record Pair(Job left, Cfg right) {}\n",
+        ),
+        (
+            "src/main/java/com/acme/Node.java",
+            "package com.acme;\npublic class Node { private Node next; }\n",
+        ),
+    ]);
+
+    let role = |src: &str, dst: &str| -> Option<String> {
+        a.edges
+            .iter()
+            .find(|e| e.ty == "USES_TYPE" && e.src == src && e.dst == dst)
+            .map(|e| e.props["role"]["$value"].as_str().unwrap().to_string())
+    };
+
+    // A field through a generic argument, which is how most Java code depends
+    // on a type.
+    assert_eq!(
+        role("com.acme.Pool", "com.acme.Job").as_deref(),
+        Some("field")
+    );
+    assert_eq!(
+        role("com.acme.Pool", "com.acme.Cfg").as_deref(),
+        Some("field")
+    );
+    // Parameter and return, then both folded onto one edge.
+    assert_eq!(
+        role("com.acme.Pool.work", "com.acme.Cfg").as_deref(),
+        Some("param")
+    );
+    assert_eq!(
+        role("com.acme.Pool.work", "com.acme.Job").as_deref(),
+        Some("return")
+    );
+    assert_eq!(
+        role("com.acme.Pool.roundTrip", "com.acme.Cfg").as_deref(),
+        Some("param, return"),
+        "one dependency, two positions, one edge"
+    );
+    // A record's components are its fields.
+    assert_eq!(
+        role("com.acme.Pair", "com.acme.Job").as_deref(),
+        Some("field")
+    );
+    assert_eq!(
+        role("com.acme.Pair", "com.acme.Cfg").as_deref(),
+        Some("field")
+    );
+
+    // Foreign types stay text, and a type never points at itself.
+    for e in a.edges.iter().filter(|e| e.ty == "USES_TYPE") {
+        assert_ne!(e.src, e.dst, "never a self-loop");
+        for foreign in ["String", "List"] {
+            assert!(!e.dst.ends_with(foreign), "{} must not get an edge", e.dst);
+        }
+    }
+}

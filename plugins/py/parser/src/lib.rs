@@ -165,6 +165,20 @@ pub struct LocalDecl {
     pub value: bool,
 }
 
+/// One type position a declaration writes down — a field, a parameter, a
+/// return — resolved in [`assemble`] into a `USES_TYPE` edge when it names a
+/// type this tree declares.
+///
+/// Only where an annotation exists: Python states a type where someone wrote
+/// one, so absence here is silence, not the absence of a dependency.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeRef {
+    pub owner: String,
+    pub role: String,
+    pub name: String,
+    pub written: String,
+}
+
 /// How a name is bound to a class the source states — an annotation, or a
 /// constructor/factory call the file can name. `caller` is a function key
 /// for params and locals, a CLASS key for instance attributes (`self.name`).
@@ -225,6 +239,9 @@ pub struct FileFacts {
     /// `(function key, return annotation as written)` when it is a plain
     /// dotted name — what types `x = make()`.
     pub returns: Vec<(String, String)>,
+    /// The type positions this file's declarations write down.
+    #[serde(default)]
+    pub type_refs: Vec<TypeRef>,
 }
 
 /// Parse one chunk of paths into per-file facts.
@@ -436,7 +453,90 @@ fn parse_file(path: &str, module: &str, text: &str, include_source: bool) -> Fil
         n.props
             .insert("file".into(), Value::String(path.to_string()));
     }
+
+    // Test-ness, weakest evidence first so the strongest is what remains.
+    //
+    // A filename is what pytest discovers by, and it is a default a config
+    // file can move — strong, not definitive. A `unittest.TestCase` subclass
+    // is the library's own rule about what a test is, so it overwrites the
+    // filename flag on the class it covers and on that class's methods.
+    if let Some(base) = test_filename(path) {
+        let desc = format!("test code: `{base}` is a name the test runners collect by default");
+        for n in facts.nodes.iter_mut() {
+            set_test_flag(&mut n.props, "filename", &desc, "strong");
+        }
+    }
+    let cases: Vec<String> = facts
+        .bases
+        .iter()
+        .filter(|(_, written, _)| unittest_base(written, &facts.bindings))
+        .map(|(key, _, _)| key.clone())
+        .collect();
+    for key in cases {
+        let prefix = format!("{key}.");
+        for n in facts
+            .nodes
+            .iter_mut()
+            .filter(|n| n.key == key || n.key.starts_with(&prefix))
+        {
+            set_test_flag(
+                &mut n.props,
+                "base-class",
+                "test code: a `unittest.TestCase` subclass, which is unittest's own definition of a test",
+                "definitive",
+            );
+        }
+    }
     facts
+}
+
+/// The filenames the test runners collect by default. pytest's `python_files`
+/// can be reconfigured in `pyproject.toml`/`pytest.ini`, which is why this is
+/// evidence and not proof — a parser does not read build configuration.
+fn test_filename(path: &str) -> Option<&str> {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
+    (base == "conftest.py" || stem.starts_with("test_") || stem.ends_with("_test")).then_some(base)
+}
+
+/// unittest's own test bases, reached through whatever name this file bound
+/// them under. A bare `TestCase` counts only when an import in this file says
+/// it came from `unittest` — a local class of that name is somebody else's
+/// `TestCase`, and guessing would flag production code as a test.
+const TEST_CASE_BASES: &[&str] = &["TestCase", "IsolatedAsyncioTestCase", "FunctionTestCase"];
+
+fn unittest_base(written: &str, bindings: &[ImportBinding]) -> bool {
+    match written.rsplit_once('.') {
+        // `unittest.TestCase`, or `ut.TestCase` after `import unittest as ut`.
+        Some((prefix, last)) => {
+            TEST_CASE_BASES.contains(&last)
+                && (prefix == "unittest"
+                    || bindings.iter().any(|b| {
+                        b.local == prefix && b.member.is_empty() && b.target == "unittest"
+                    }))
+        }
+        // `TestCase`, or `TC` after `from unittest import TestCase as TC`.
+        None => bindings.iter().any(|b| {
+            b.local == written
+                && b.target == "unittest"
+                && TEST_CASE_BASES.contains(&b.member.as_str())
+        }),
+    }
+}
+
+/// Mark a node as test code: what the evidence was, and — in the companion
+/// `_` property the renderers keep out of sight and the embedder out of its
+/// vectors — how much that evidence is worth. Two properties rather than one
+/// because the second is for a reader weighing the first, not for display.
+fn set_test_flag(props: &mut Props, kind: &str, desc: &str, confidence: &str) {
+    props.insert(
+        "test_flag".into(),
+        serde_json::json!({ "$desc": desc, "$value": kind }),
+    );
+    props.insert(
+        "_test_flag_confidence".into(),
+        Value::String(confidence.into()),
+    );
 }
 
 struct Walker<'a> {
@@ -585,6 +685,63 @@ impl Walker<'_> {
     /// A written type usable by receiver typing: a plain (possibly dotted)
     /// identifier — `Foo`, `pkg.mod.Foo`. Subscripts (`Optional[Foo]`),
     /// unions and strings are a checker's business and yield nothing.
+    /// Every named type an annotation mentions, outermost first:
+    /// `dict[str, list[Job]]` yields `dict`, `str`, `list`, `Job`.
+    ///
+    /// Where [`Walker::dotted_ident`] takes only a plain dotted name — a
+    /// receiver's methods are that name's — a *dependency* does not stop at
+    /// the subscript: `jobs: list[Job]` depends on `Job`. A string annotation
+    /// is a forward reference and names a type as surely as a bare one.
+    fn ann_names(&self, e: &ast::Expr, out: &mut Vec<String>) {
+        match e {
+            ast::Expr::Name(_) | ast::Expr::Attribute(_) => {
+                if let Some(name) = Self::dotted_ident(&self.snippet(e.range())) {
+                    out.push(name);
+                }
+            }
+            ast::Expr::StringLiteral(s) => {
+                if let Some(name) = Self::dotted_ident(s.value.to_str()) {
+                    out.push(name);
+                }
+            }
+            ast::Expr::Subscript(s) => {
+                self.ann_names(&s.value, out);
+                self.ann_names(&s.slice, out);
+            }
+            ast::Expr::Tuple(t) => {
+                for e in &t.elts {
+                    self.ann_names(e, out);
+                }
+            }
+            ast::Expr::List(l) => {
+                for e in &l.elts {
+                    self.ann_names(e, out);
+                }
+            }
+            // `int | None`, the 3.10 union.
+            ast::Expr::BinOp(b) => {
+                self.ann_names(&b.left, out);
+                self.ann_names(&b.right, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// Record every named type an annotation mentions as one type position of
+    /// `owner`.
+    fn type_refs(&mut self, owner: &str, role: &str, name: &str, e: &ast::Expr) {
+        let mut names = Vec::new();
+        self.ann_names(e, &mut names);
+        for written in names {
+            self.facts.type_refs.push(TypeRef {
+                owner: owner.to_string(),
+                role: role.to_string(),
+                name: name.to_string(),
+                written,
+            });
+        }
+    }
+
     fn dotted_ident(text: &str) -> Option<String> {
         let t = text.trim();
         let ok = !t.is_empty()
@@ -750,26 +907,29 @@ impl Walker<'_> {
             if pname == "self" || pname == "cls" {
                 continue;
             }
-            if let Some(ann) = &param.parameter.annotation
-                && let Some(written) = Self::dotted_ident(&self.snippet(ann.range()))
-                && !self
-                    .facts
-                    .hints
-                    .iter()
-                    .any(|h| h.caller == key && h.name == pname)
-            {
-                self.facts.hints.push(Hint {
-                    caller: key.clone(),
-                    name: pname,
-                    written,
-                    constructed: false,
-                });
+            if let Some(ann) = &param.parameter.annotation {
+                self.type_refs(&key.clone(), "param", &pname, ann);
+                if let Some(written) = Self::dotted_ident(&self.snippet(ann.range()))
+                    && !self
+                        .facts
+                        .hints
+                        .iter()
+                        .any(|h| h.caller == key && h.name == pname)
+                {
+                    self.facts.hints.push(Hint {
+                        caller: key.clone(),
+                        name: pname,
+                        written,
+                        constructed: false,
+                    });
+                }
             }
         }
-        if let Some(ret) = &f.returns
-            && let Some(written) = Self::dotted_ident(&self.snippet(ret.range()))
-        {
-            self.facts.returns.push((key.clone(), written));
+        if let Some(ret) = &f.returns {
+            self.type_refs(&key.clone(), "return", "", ret);
+            if let Some(written) = Self::dotted_ident(&self.snippet(ret.range())) {
+                self.facts.returns.push((key.clone(), written));
+            }
         }
         self.body_hints(&key, &f.body);
     }
@@ -803,6 +963,8 @@ impl Walker<'_> {
                         if seen_fields.insert(n.id.to_string()) {
                             fields.push(entry);
                         }
+                        let fname = n.id.to_string();
+                        self.type_refs(&key.clone(), "field", &fname, &a.annotation);
                         // A class-level annotation states the attribute's
                         // class for every `self.x.m()` in the body.
                         if let Some(written) =

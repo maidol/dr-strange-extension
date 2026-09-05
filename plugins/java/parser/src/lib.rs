@@ -112,6 +112,17 @@ pub struct Import {
     pub is_static: bool,
 }
 
+/// One type position a declaration writes down — a field, a parameter, a
+/// return — resolved in [`assemble`] into a `USES_TYPE` edge when it names a
+/// type this tree declares.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeRef {
+    pub owner: String,
+    pub role: String,
+    pub name: String,
+    pub written: String,
+}
+
 /// A declared type: name, kind, and its method surface (for cross-file
 /// static and inherited resolution).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +161,9 @@ pub struct FileFacts {
     pub opaque: usize,
     /// Type bindings the source states (params, locals, fields).
     pub hints: Vec<Hint>,
+    /// The type positions this file's declarations write down.
+    #[serde(default)]
+    pub type_refs: Vec<TypeRef>,
     /// `(method key, declared return as written)` when it names a plain
     /// type — what types a static-factory chain.
     pub returns: Vec<(String, String)>,
@@ -223,7 +237,91 @@ fn parse_file(path: &str, text: &str, include_source: bool) -> FileFacts {
         n.props
             .insert("file".into(), Value::String(path.to_string()));
     }
+
+    // Test-ness, weakest evidence first so the strongest is what remains.
+    //
+    // `src/test/java` is Maven's and Gradle's source-set layout — a build
+    // convention they both enforce, and one a build file can still redraw.
+    // A test annotation is JUnit's and TestNG's own definition of a test, so
+    // it overwrites the layout flag on the method it marks and on the type
+    // holding that method: a class with an `@Test` in it is a test class.
+    if is_test_source_set(path) {
+        for n in facts.nodes.iter_mut() {
+            set_test_flag(
+                &mut n.props,
+                "build-layout",
+                "test code: under `src/test/java`, the test source set Maven and Gradle compile apart from `src/main/java`",
+                "strong",
+            );
+        }
+    }
+    let marked: Vec<String> = facts
+        .clauses
+        .iter()
+        .filter(|(_, written, ty, _)| ty == "ANNOTATED_BY" && is_test_annotation(written))
+        .map(|(key, _, _, _)| key.clone())
+        .collect();
+    for key in marked {
+        let owner = key.rsplit_once('.').map(|(o, _)| o.to_string());
+        for n in facts
+            .nodes
+            .iter_mut()
+            .filter(|n| n.key == key || owner.as_deref().is_some_and(|o| n.key == o))
+        {
+            set_test_flag(
+                &mut n.props,
+                "annotation",
+                "test code: carries a JUnit/TestNG test annotation, or holds a method that does",
+                "definitive",
+            );
+        }
+    }
     facts
+}
+
+/// Maven's and Gradle's shared source-set layout. `src/test/kotlin` and the
+/// rest are other plugins' business; this one claims `.java`.
+fn is_test_source_set(path: &str) -> bool {
+    path.replace('\\', "/").contains("src/test/java/")
+}
+
+/// The annotations JUnit and TestNG define a test by — the test methods
+/// themselves and the lifecycle hooks that only exist to serve them. Written
+/// unqualified or fully qualified alike; the last segment is the name.
+const TEST_ANNOTATIONS: &[&str] = &[
+    "Test",
+    "ParameterizedTest",
+    "RepeatedTest",
+    "TestFactory",
+    "TestTemplate",
+    "BeforeEach",
+    "AfterEach",
+    "BeforeAll",
+    "AfterAll",
+    "Before",
+    "After",
+    "BeforeClass",
+    "AfterClass",
+];
+
+fn is_test_annotation(written: &str) -> bool {
+    let last = written.rsplit('.').next().unwrap_or(written);
+    TEST_ANNOTATIONS.contains(&last)
+}
+
+/// Mark a node as test code: what the evidence was, and — in the companion
+/// `_` property the renderers keep out of sight and the embedder out of its
+/// vectors — how much that evidence is worth. Two properties rather than one
+/// because the second is for a reader weighing the first, not for display.
+fn set_test_flag(props: &mut Props, kind: &str, desc: &str, confidence: &str) {
+    props.insert(
+        "test_flag".into(),
+        serde_json::json!({ "$desc": desc, "$value": kind }),
+    );
+    props.insert(
+        "_test_flag_confidence".into(),
+        Value::String(confidence.into()),
+    );
 }
 
 struct Walker<'a> {
@@ -382,7 +480,10 @@ impl Walker<'_> {
                     && let (Some(t), Some(n)) =
                         (p.child_by_field_name("type"), p.child_by_field_name("name"))
                 {
-                    fields.push(format!("{}: {}", self.text(n), self.text(t)));
+                    let fname = self.text(n);
+                    fields.push(format!("{fname}: {}", self.text(t)));
+                    // A record's components are its fields.
+                    self.type_refs(&key, "field", &fname, t);
                 }
             }
         }
@@ -406,6 +507,9 @@ impl Walker<'_> {
                                 let fname = self.text(n);
                                 if let Some(written) = &typed {
                                     self.hint(&key, fname.clone(), written.clone());
+                                }
+                                if let Some(tnode) = member.child_by_field_name("type") {
+                                    self.type_refs(&key, "field", &fname, tnode);
                                 }
                                 fields.push(format!("{fname}: {ty}"));
                             }
@@ -443,6 +547,9 @@ impl Walker<'_> {
                                             let fname = self.text(n);
                                             if let Some(written) = &typed {
                                                 self.hint(&key, fname.clone(), written.clone());
+                                            }
+                                            if let Some(tnode) = m.child_by_field_name("type") {
+                                                self.type_refs(&key, "field", &fname, tnode);
                                             }
                                             fields.push(format!("{fname}: {ty}"));
                                         }
@@ -593,12 +700,17 @@ impl Walker<'_> {
                         pnode.child_by_field_name("type"),
                         pnode.child_by_field_name("name"),
                     )
-                    && let Some(written) = self.type_name(t)
                 {
                     let pname = self.text(n);
-                    self.hint(&key, pname, written);
+                    if let Some(written) = self.type_name(t) {
+                        self.hint(&key, pname.clone(), written);
+                    }
+                    self.type_refs(&key, "param", &pname, t);
                 }
             }
+        }
+        if let Some(t) = node.child_by_field_name("type") {
+            self.type_refs(&key, "return", "", t);
         }
 
         if let Some(body) = node.child_by_field_name("body") {
@@ -825,6 +937,48 @@ impl Walker<'_> {
     /// The name a type expression writes, generics stripped down to what
     /// they subscript: `Map<K, V>` names `Map`, `com.acme.Box<T>` names
     /// `com.acme.Box`.
+    /// Every named type a type expression mentions, outermost first:
+    /// `Map<String, List<Job>>` yields `Map`, `String`, `List`, `Job`.
+    ///
+    /// Where [`Walker::type_name`] stops at the head — a receiver's methods
+    /// are the head's, not its arguments' — a *dependency* does not: a field
+    /// of type `List<Job>` depends on `Job`, and that is the fact
+    /// `USES_TYPE` records.
+    fn type_names(&self, node: TsNode, out: &mut Vec<String>) {
+        match node.kind() {
+            // A name is a leaf: `a.b.C` is one type, and its parts are not
+            // three more.
+            "type_identifier" | "scoped_type_identifier" | "scoped_identifier" => {
+                out.push(self.text(node))
+            }
+            // Everything else is a shape around names — `generic_type`,
+            // `type_arguments`, `array_type`, `annotated_type`, a wildcard
+            // bound — so walk through it and take the names it holds.
+            _ => {
+                for c in node.named_children(&mut node.walk()) {
+                    self.type_names(c, out);
+                }
+            }
+        }
+    }
+
+    /// Record every named type `node` mentions as one type position of
+    /// `owner`.
+    fn type_refs(&mut self, owner: &str, role: &str, name: &str, node: TsNode) {
+        let mut names = Vec::new();
+        self.type_names(node, &mut names);
+        names.sort();
+        names.dedup();
+        for written in names {
+            self.facts.type_refs.push(TypeRef {
+                owner: owner.to_string(),
+                role: role.to_string(),
+                name: name.to_string(),
+                written,
+            });
+        }
+    }
+
     fn type_name(&self, node: TsNode) -> Option<String> {
         match node.kind() {
             "type_identifier" => Some(self.text(node)),

@@ -10,7 +10,7 @@ uv 背后的解析器，与语言同步（含 3.12 的 `type` 语句）——只
 ## 目录结构
 
 ```
-parser/     drsg-py-parser——语言逻辑，21 个原生测试
+parser/     drsg-py-parser——语言逻辑，39 个原生测试
 component/  drsg-plugin-py——Guest 实现 + rmp-serde 部分结果
 ```
 
@@ -51,6 +51,7 @@ deploy.main                           游离脚本就是它的文件名主干
 | `IMPORTS` | 模块 → 模块（绝对目标；相对导入在解析阶段就地解析，那里知道当前模块是谁） | import 语句 |
 | `REFERENCES` | 函数 → 它**作为值传递**（而非调用）的函数；调度器拿到的若是可调用对象本身，则带 `concurrent: scheduled` | 该实参 |
 | `EXTENDS` | 类 → 基类——句法；带下标的基类延伸到它所下标的对象（`Generic[T]` → `typing.Generic`） | 类所在行 |
+| `USES_TYPE` | 声明 → 其**注解所指**的类型；`role` 记在边上（`field`、`param`、`return`）。下标、联合类型与字符串前向引用都会被走入——`list[Job]` 就是对 `Job` 的依赖。**仅在写下了注解处**：未加注解的参数不陈述任何类型，其沉默并不等于没有依赖 | — |
 
 ## 解析——确定性的界线
 
@@ -82,6 +83,25 @@ deploy.main                           游离脚本就是它的文件名主干
 
 报告注记：未解析的成员/属性调用 · 外部调用 · 合并的声明。
 
+## 测试代码
+
+"谁调用了它"这个问题，测试代码与生产代码给出的答案分量不同；分不清两者的读者
+会把一个测试算作一个使用者。两条属性说明此事：`test_flag` 记录**依据是什么**，
+`_test_flag_confidence` 记录**该依据有多少分量**——下划线前缀使后者不进入紧凑
+渲染，也不进入向量，那里它只会是噪声；`cypher`、`get_node` 与 `export` 仍会返
+回它，而衡量此标记的读者正是在那里查看。源码中没有写下依据时，不作任何标记。
+
+| `test_flag` | `_test_flag_confidence` | 依据 |
+|---|---|---|
+| `base-class` | `definitive` | `unittest.TestCase` 子类（同样包括 `IsolatedAsyncioTestCase`、`FunctionTestCase`），无论该文件用什么名字导入它 |
+| `filename` | `strong` | `test_*.py`、`*_test.py`、`conftest.py` |
+
+两条规则分级，留下的是更强的那条：文件名只是运行器**默认**收集的形状，
+`pyproject.toml` 可以改动它；而 `TestCase` 子类是 unittest 自己对测试的定义——
+因此它会覆盖该类及其方法上较弱的文件名标记。裸写的 `TestCase` 基类，只有当同一
+文件中的 import 表明它来自 `unittest` 时才算数：本地同名类是别人的 `TestCase`，
+标记其子类就会把生产代码称作测试。
+
 ## 选项（`[plugins.py]`）
 
 | 键 | 效果 |
@@ -91,7 +111,7 @@ deploy.main                           游离脚本就是它的文件名主干
 ## 构建与测试
 
 ```console
-$ cd parser && cargo test             # 21 个测试
+$ cd parser && cargo test             # 39 个测试
 $ just py-plugin
 $ drsg plugin install component/target/wasm32-wasip2/release/drsg_plugin_py.wasm
 ```

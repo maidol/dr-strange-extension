@@ -2718,3 +2718,218 @@ fn constants_variants_and_rebindings_type() {
     assert!(ledger.is_empty(), "every receiver was typed: {ledger:#?}");
     every_edge_has_endpoints(&out);
 }
+
+/// Three rules, all of them cargo's or the language's own: the `#[test]`
+/// family, a `#[cfg(test)]` module (a scope, so it reaches the `impl` blocks
+/// written inside it), and a file under `tests/`. Production code beside them
+/// stays unflagged, and a `#[cfg(not(test))]` item is the opposite of a test.
+#[test]
+fn test_code_is_flagged_by_attribute_scope_and_target() {
+    let t = Tree::new("testflag");
+    t.write("Cargo.toml", "[package]\nname = \"k\"\n");
+    t.write(
+        "src/lib.rs",
+        r#"
+pub struct Engine;
+
+impl Engine {
+    pub fn start(&self) {}
+}
+
+#[cfg(not(test))]
+pub fn production_only() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fixture { n: u32 }
+
+    impl Fixture {
+        fn make() -> Self { Fixture { n: 1 } }
+    }
+
+    #[test]
+    fn starts() { Engine.start(); }
+
+    fn helper() {}
+}
+
+#[tokio::test]
+async fn also_a_test() {}
+"#,
+    );
+    t.write(
+        "tests/integration.rs",
+        "pub fn drives_it() {}\n\npub struct Harness;\n\nimpl Harness {\n    pub fn run(&self) {}\n}\n",
+    );
+    let a = run(&t);
+
+    let flagged = |key: &str| -> (String, String) {
+        let n = a
+            .nodes
+            .iter()
+            .find(|n| n.key == key)
+            .unwrap_or_else(|| panic!("no node {key} in {:?}", keys(&a)));
+        (
+            text_of(
+                n.props
+                    .get("test_flag")
+                    .unwrap_or_else(|| panic!("{key} carries no test_flag: {:?}", n.props)),
+            )
+            .unwrap(),
+            text_of(n.props.get("_test_flag_confidence").unwrap()).unwrap(),
+        )
+    };
+
+    // The attribute is the narrowest evidence and survives the scope pass.
+    assert_eq!(
+        flagged("k::tests::starts"),
+        ("attribute".into(), "definitive".into())
+    );
+    assert_eq!(
+        flagged("k::also_a_test"),
+        ("attribute".into(), "definitive".into()),
+        "a runtime's own test attribute is still a test attribute"
+    );
+
+    // The `#[cfg(test)]` module is a scope: everything under it, impl methods
+    // included, is compiled out of the library.
+    for key in [
+        "k::tests",
+        "k::tests::helper",
+        "k::tests::Fixture",
+        "k::tests::Fixture::make",
+    ] {
+        assert_eq!(
+            flagged(key),
+            ("build-rule".into(), "definitive".into()),
+            "{key}"
+        );
+    }
+
+    // An integration target is a scope too.
+    for key in [
+        "k::tests::integration::drives_it",
+        "k::tests::integration::Harness",
+        "k::tests::integration::Harness::run",
+    ] {
+        assert_eq!(
+            flagged(key),
+            ("build-rule".into(), "definitive".into()),
+            "{key}"
+        );
+    }
+
+    for key in ["k::Engine", "k::Engine::start", "k::production_only", "k"] {
+        assert!(
+            !a.nodes
+                .iter()
+                .find(|n| n.key == key)
+                .unwrap()
+                .props
+                .contains_key("test_flag"),
+            "{key} must not be flagged"
+        );
+    }
+}
+
+/// A declared type is a dependency as surely as a call is. Fields,
+/// parameters, returns, enum payloads and alias targets all say so — folded
+/// to one edge per pair carrying the union of the positions, generic
+/// arguments walked, foreign types left alone, and never a self-loop.
+#[test]
+fn declared_types_become_uses_type_edges() {
+    let t = Tree::new("usestype");
+    t.write("Cargo.toml", "[package]\nname = \"k\"\n");
+    t.write(
+        "src/lib.rs",
+        r#"
+use std::collections::HashMap;
+use std::sync::mpsc;
+
+pub struct Job;
+
+pub struct Cfg {
+    pub n: u32,
+}
+
+pub type Jobs = Vec<Job>;
+
+pub enum Event {
+    Started(Job),
+    Nothing,
+}
+
+pub struct Pool {
+    pub jobs: mpsc::Sender<Job>,
+    pub index: HashMap<String, Cfg>,
+}
+
+pub struct Node {
+    pub next: Option<Box<Node>>,
+}
+
+pub fn work(c: &Cfg) -> Job {
+    let _ = c;
+    Job
+}
+
+pub fn foreign(s: String) -> u32 {
+    let _ = s;
+    0
+}
+
+pub fn round_trip(c: Cfg) -> Cfg {
+    c
+}
+"#,
+    );
+    let a = run(&t);
+
+    let uses = |src: &str, dst: &str| -> Option<String> {
+        a.edges
+            .iter()
+            .find(|e| e.ty == "USES_TYPE" && e.src == src && e.dst == dst)
+            .map(|e| text_of(&e.props["role"]).unwrap())
+    };
+
+    // A field, through the generic argument of a foreign wrapper: this is how
+    // most code depends on a type, and stopping at `Sender` would miss it.
+    assert_eq!(uses("k::Pool", "k::Job").as_deref(), Some("field"));
+    assert_eq!(uses("k::Pool", "k::Cfg").as_deref(), Some("field"));
+    // Parameter and return fold to one edge carrying both positions.
+    assert_eq!(uses("k::work", "k::Cfg").as_deref(), Some("param"));
+    assert_eq!(uses("k::work", "k::Job").as_deref(), Some("return"));
+    assert_eq!(
+        uses("k::round_trip", "k::Cfg").as_deref(),
+        Some("param, return"),
+        "one dependency, two positions, one edge"
+    );
+    // An enum payload and an alias target.
+    assert_eq!(uses("k::Event", "k::Job").as_deref(), Some("variant"));
+    assert_eq!(uses("k::Jobs", "k::Job").as_deref(), Some("alias"));
+
+    // Foreign types stay text: no edge to String, u32, Vec, HashMap, Sender.
+    for dst in ["String", "u32", "Vec", "HashMap", "Sender", "Option", "Box"] {
+        assert!(
+            !a.edges
+                .iter()
+                .any(|e| e.ty == "USES_TYPE" && e.dst.ends_with(dst)),
+            "{dst} is not declared here and must not get an edge"
+        );
+    }
+    // A type that mentions itself is a real shape and a useless edge.
+    assert!(
+        !a.edges
+            .iter()
+            .any(|e| e.ty == "USES_TYPE" && e.src == e.dst),
+        "never a self-loop"
+    );
+    // The ledger says what it did and what it left.
+    assert!(
+        a.notes.iter().any(|n| n.contains("USES_TYPE")),
+        "{:?}",
+        a.notes
+    );
+}

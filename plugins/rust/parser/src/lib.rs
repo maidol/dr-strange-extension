@@ -182,6 +182,18 @@ pub struct FileFacts {
     local_hints: Vec<(String, String, LocalHint)>,
     /// `impl` blocks, held whole until every file is known — see [`walk_impl`].
     impls: Vec<ImplBlock>,
+    /// `(fn key, parameter name, type as written)` — the declared parameter
+    /// types, for the `USES_TYPE` edges. Returns, fields, variants and alias
+    /// targets are already collected for receiver typing; parameters were the
+    /// one type position nothing else needed.
+    #[serde(default)]
+    param_types: Vec<(String, String, String)>,
+    /// Module keys carrying `#[cfg(test)]` — the scopes whose every item is
+    /// compiled out of the production build. Everything under one is test
+    /// code, including `impl` blocks whose methods are keyed only at
+    /// assemble.
+    #[serde(default)]
+    cfg_test_scopes: Vec<String>,
     /// `(module, macro path, arguments)` for each item-position invocation —
     /// the places where items exist that this parse cannot see.
     macro_calls: Vec<(String, String, String, u64)>,
@@ -358,6 +370,50 @@ fn parse_file(path: &str, module: &str, text: &str, include_source: bool) -> Fil
                 .insert("file".into(), Value::String(source_path(path)));
         }
     }
+
+    // Test-ness, from the two scopes cargo compiles apart from the library.
+    //
+    // A file under `tests/` or `benches/` is a target of its own, built only
+    // by `cargo test`/`cargo bench`; a `#[cfg(test)]` module is compiled out
+    // of the library entirely. Both are the toolchain's rule rather than a
+    // convention, which is what makes them `definitive` — and both are
+    // scopes, so they reach the `impl` blocks written inside them, whose
+    // methods are keyed only at assemble.
+    let target = target_root(path).and_then(|(_, root, _)| match root {
+        "tests/" => Some("test code: a file under `tests/`, which cargo builds as an integration-test target and never links into the library"),
+        "benches/" => Some("test code: a file under `benches/`, which cargo builds as a bench target and never links into the library"),
+        _ => None,
+    });
+    if let Some(desc) = target {
+        for n in &mut f.nodes {
+            set_test_flag(&mut n.props, "build-rule", desc, "definitive");
+        }
+        for b in &mut f.impls {
+            for m in &mut b.methods {
+                set_test_flag(&mut m.props, "build-rule", desc, "definitive");
+            }
+        }
+    }
+    let scopes = f.cfg_test_scopes.clone();
+    for scope in &scopes {
+        let inner = format!("{scope}::");
+        for n in f
+            .nodes
+            .iter_mut()
+            .filter(|n| n.key == *scope || n.key.starts_with(&inner))
+        {
+            set_test_flag(&mut n.props, "build-rule", CFG_TEST_DESC, "definitive");
+        }
+        for b in f
+            .impls
+            .iter_mut()
+            .filter(|b| b.module == *scope || b.module.starts_with(&inner))
+        {
+            for m in &mut b.methods {
+                set_test_flag(&mut m.props, "build-rule", CFG_TEST_DESC, "definitive");
+            }
+        }
+    }
     f
 }
 
@@ -488,6 +544,9 @@ fn walk_items(items: &[syn::Item], parent: &str, include_source: bool, f: &mut F
                 collect_calls(&key, &func.block, f);
                 if let Some(ret) = ret_written(&func.sig) {
                     f.returns.push((key.clone(), ret));
+                }
+                for (name, written) in sig_params(&func.sig) {
+                    f.param_types.push((key.clone(), name, written));
                 }
                 for (idx, args) in closure_sig(&func.sig) {
                     f.closure_sigs.push((key.clone(), idx, args));
@@ -694,6 +753,12 @@ fn walk_items(items: &[syn::Item], parent: &str, include_source: bool, f: &mut F
                         f.scopes.insert(mkey.clone(), parent.to_string());
                         f.edges
                             .push(edge_at(&key, &mkey, "HAS_METHOD", line_of(&m.sig.ident)));
+                        if let Some(ret) = ret_written(&m.sig) {
+                            f.returns.push((mkey.clone(), ret));
+                        }
+                        for (name, written) in sig_params(&m.sig) {
+                            f.param_types.push((mkey.clone(), name, written));
+                        }
                     }
                 }
             }
@@ -703,6 +768,9 @@ fn walk_items(items: &[syn::Item], parent: &str, include_source: bool, f: &mut F
             syn::Item::Mod(m) => {
                 if let Some((_, inner)) = &m.content {
                     let key = format!("{parent}::{}", m.ident);
+                    if m.attrs.iter().any(cfg_says_test) {
+                        f.cfg_test_scopes.push(key.clone());
+                    }
                     let mut imports = Vec::new();
                     collect_imports(inner, &key, &mut imports, &mut f.reexports);
                     f.imports.extend(imports.iter().map(|(name, path, line)| {
@@ -770,6 +838,7 @@ fn walk_impl(im: &syn::ItemImpl, parent: &str, include_source: bool, f: &mut Fil
                         closures: body.closures,
                         closure_sigs: closure_sig(&m.sig),
                         ret: ret_written(&m.sig),
+                        param_types: sig_params(&m.sig),
                         locals: local_hints(&m.block, &m.sig, &generics),
                         line: line_of(&m.sig.ident),
                     }
@@ -826,6 +895,10 @@ struct ImplMethod {
     /// `Self` is resolved to the impl's type at assemble, where the type's
     /// key is known.
     ret: Option<String>,
+    /// `(parameter name, type as written)`, `Self` resolved at assemble with
+    /// the return above.
+    #[serde(default)]
+    param_types: Vec<(String, String)>,
     /// The body's type-known locals, for its method calls.
     locals: Vec<(String, LocalHint)>,
 }
@@ -1651,6 +1724,25 @@ fn written_ty(ty: &syn::Type) -> Option<String> {
 /// A written type back into its base and its arguments: `Vec<Node>` →
 /// (`Vec`, [`Node`]); `(usize, Node)` → (`(`, [`usize`, `Node`]); a bare
 /// path → itself and nothing. Arguments nest, so only the top level splits.
+/// Every name a written type mentions, outermost first:
+/// `HashMap<String, Vec<Job>>` yields `HashMap`, `String`, `Vec`, `Job`.
+///
+/// A type reference is not only its head — `mpsc::Sender<Job>` is how most
+/// code depends on a `Job`, and stopping at `Sender` would miss exactly the
+/// dependency worth recording. The synthetic heads [`written_ty`] writes for
+/// shapes that are not paths (`(`, `slice`, `array`, `_`) name no type and
+/// are stepped over rather than resolved.
+fn named_types(written: &str, out: &mut Vec<String>) {
+    const NOT_A_NAME: &[&str] = &["(", "_", "slice", "array", ""];
+    let (base, args) = split_written(written);
+    if !NOT_A_NAME.contains(&base) {
+        out.push(base.to_string());
+    }
+    for arg in args {
+        named_types(arg, out);
+    }
+}
+
 fn split_written(written: &str) -> (&str, Vec<&str>) {
     let written = written.trim();
     let (open, close) = if written.starts_with('(') {
@@ -1870,6 +1962,9 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
     // file's imports — what a dotted receiver walks. The module rides along
     // for scope-narrowed resolution of the written type.
     let mut fields_map: BTreeMap<(String, String), (String, String)> = BTreeMap::new();
+    // `(fn key, parameter name, type as written)` — the one type position no
+    // other pass needed, collected for `USES_TYPE`.
+    let mut param_types: Vec<(String, String, String)> = Vec::new();
     // Trait conformance, for method resolution: which traits a type
     // implements, and where its trait-impl methods actually live.
     let mut impls_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -1892,6 +1987,13 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
         let through_imports = |p: &str| expand_path(p, &imports, &f.module);
         for (key, ret) in &f.returns {
             returns_map.insert(key.clone(), expand_written(ret, &through_imports));
+        }
+        for (key, name, written) in &f.param_types {
+            param_types.push((
+                key.clone(),
+                name.clone(),
+                expand_written(written, &through_imports),
+            ));
         }
         for (key, written) in &f.consts {
             if let Some(name) = key.rsplit("::").next() {
@@ -2156,6 +2258,13 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
                 };
                 if let Some(ret) = &m.ret {
                     returns_map.insert(mkey.clone(), expand_written(ret, &self_or));
+                }
+                for (name, written) in &m.param_types {
+                    param_types.push((
+                        mkey.clone(),
+                        name.clone(),
+                        expand_written(written, &self_or),
+                    ));
                 }
                 for (ident, hint) in &m.locals {
                     local_inits
@@ -2770,6 +2879,82 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
         out.edges.push(e);
     }
 
+    // A declared type is a dependency as surely as a call is. Until this
+    // existed, `impact` on a type saw only who *built* one — never who takes
+    // it as a parameter, returns it, or holds it in a field — and answered a
+    // fraction of the blast radius with no sign that it had.
+    //
+    // Every source below already existed for receiver typing, with paths
+    // expanded and `Self` resolved; parameters were the one position nothing
+    // else needed. Only types this tree declares get an edge: a foreign one
+    // stays in `signature`/`fields` as text, which is all this parser knows
+    // about it anyway.
+    let mut type_refs: Vec<(&str, String, String, String)> = Vec::new(); // role, owner, name, written
+    for ((owner, field), (written, _)) in &fields_map {
+        type_refs.push(("field", owner.clone(), field.clone(), written.clone()));
+    }
+    for ((owner, variant), (fields, _)) in &variant_map {
+        for (_, written) in fields {
+            type_refs.push(("variant", owner.clone(), variant.clone(), written.clone()));
+        }
+    }
+    for (owner, written) in &returns_map {
+        type_refs.push(("return", owner.clone(), String::new(), written.clone()));
+    }
+    for (owner, (_, target, _)) in &alias_map {
+        type_refs.push(("alias", owner.clone(), String::new(), target.clone()));
+    }
+    for (owner, name, written) in &param_types {
+        type_refs.push(("param", owner.clone(), name.clone(), written.clone()));
+    }
+
+    // One edge per (owner, type) carrying the union of the roles, the way a
+    // repeated call folds to one edge: a function taking a `Cfg` and
+    // returning one states two facts about one dependency.
+    let mut uses: BTreeMap<(String, String), (BTreeSet<&str>, String)> = BTreeMap::new();
+    let mut foreign_type_refs = 0usize;
+    for (role, owner, name, written) in type_refs {
+        let module = scopes.get(&owner).cloned().unwrap_or_default();
+        let mut named = Vec::new();
+        named_types(&written, &mut named);
+        let mut landed = false;
+        for base in named {
+            let Some(target) = typing.type_key(&base, &module) else {
+                continue;
+            };
+            landed = true;
+            // A type that mentions itself (`next: Option<Box<Node>>`) is a
+            // real shape and a useless edge — the same call `REFERENCES`
+            // makes.
+            if target == owner {
+                continue;
+            }
+            let slot = uses
+                .entry((owner.clone(), target))
+                .or_insert_with(|| (BTreeSet::new(), name.clone()));
+            slot.0.insert(role);
+        }
+        if !landed {
+            foreign_type_refs += 1;
+        }
+    }
+    let type_ref_edges = uses.len();
+    for ((owner, target), (roles, name)) in uses {
+        let mut e = edge_at(&owner, &target, "USES_TYPE", 0);
+        e.props.remove("line");
+        e.props.insert(
+            "role".into(),
+            json!({
+                "$desc": "the type position this declaration names the type in",
+                "$value": roles.iter().copied().collect::<Vec<_>>().join(", "),
+            }),
+        );
+        if !name.is_empty() {
+            e.props.insert("name".into(), Value::String(name));
+        }
+        out.edges.push(e);
+    }
+
     out.nodes.extend(unresolved_nodes.into_values());
 
     // Last, because resolving calls is itself a source of external nodes: a
@@ -2797,6 +2982,14 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
         out.notes.push(format!(
             "{ambiguous} call(s) matched more than one function by name and were \
              left out: resolving them needs import and generic resolution"
+        ));
+    }
+    if type_ref_edges > 0 || foreign_type_refs > 0 {
+        out.notes.push(format!(
+            "{type_ref_edges} type reference(s) recorded as `USES_TYPE` — what a \
+             declaration's fields, parameters, returns and variants are typed by; \
+             {foreign_type_refs} more name types this tree does not declare and are \
+             left as written text on the node"
         ));
     }
     if macro_invocations > 0 {
@@ -4668,6 +4861,71 @@ fn variant_of(v: &syn::Variant) -> String {
 /// `match` must keep a wildcard arm and the type cannot be constructed
 /// literally outside its crate. Absent means exhaustive, following the
 /// convention `visibility` and `is_async` already use.
+const CFG_TEST_DESC: &str =
+    "test code: inside a `#[cfg(test)]` module, which is compiled out of the library build";
+
+/// The `#[test]`-family attributes: the bare one, the runtimes' own
+/// (`#[tokio::test]`, `#[async_std::test]`, `#[actix_web::test]` — the last
+/// segment is what says it), `#[bench]`, and `#[rstest]`. An attribute that
+/// merely *contains* the word, `#[test_case(…)]` among them, is left alone:
+/// this parser marks what the harness runs, not what looks related.
+fn is_test_attr(attr: &syn::Attribute) -> bool {
+    let last = attr.path().segments.last().map(|s| s.ident.to_string());
+    matches!(last.as_deref(), Some("test" | "bench" | "rstest"))
+}
+
+/// Whether a `#[cfg(…)]` names the `test` configuration — `cfg(test)`,
+/// `cfg(all(test, …))`, `cfg(any(test, …))`.
+///
+/// Reads tokens rather than text, which settles both traps for free:
+/// `cfg(feature = "test")` carries a string literal and not the identifier,
+/// and `cfg(not(test))` means the opposite, so its group is skipped.
+fn cfg_says_test(attr: &syn::Attribute) -> bool {
+    attr.path().is_ident("cfg")
+        && attr
+            .meta
+            .require_list()
+            .is_ok_and(|l| tokens_say_test(l.tokens.clone()))
+}
+
+fn tokens_say_test(tokens: proc_macro2::TokenStream) -> bool {
+    let mut it = tokens.into_iter().peekable();
+    while let Some(tree) = it.next() {
+        match tree {
+            proc_macro2::TokenTree::Ident(id) => {
+                if id == "test" {
+                    return true;
+                }
+                if id == "not" && matches!(it.peek(), Some(proc_macro2::TokenTree::Group(_))) {
+                    it.next();
+                }
+            }
+            proc_macro2::TokenTree::Group(g) if tokens_say_test(g.stream()) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Mark a node as test code: what the evidence was, and — in the companion
+/// `_` property the renderers keep out of sight and the embedder out of its
+/// vectors — how much that evidence is worth. Two properties rather than one
+/// because the second is for a reader weighing the first, not for display.
+///
+/// First writer wins. Every rule here is definitive, so a later pass can only
+/// restate what a narrower one already said: a `#[test]` fn inside a
+/// `#[cfg(test)]` module keeps `attribute`, the more specific of the two.
+fn set_test_flag(props: &mut Props, kind: &str, desc: &str, confidence: &str) {
+    if props.contains_key("test_flag") {
+        return;
+    }
+    props.insert("test_flag".into(), json!({ "$desc": desc, "$value": kind }));
+    props.insert(
+        "_test_flag_confidence".into(),
+        Value::String(confidence.into()),
+    );
+}
+
 fn set_non_exhaustive(f: &mut FileFacts, attrs: &[syn::Attribute]) {
     if !attrs.iter().any(|a| a.path().is_ident("non_exhaustive")) {
         return;
@@ -4840,6 +5098,14 @@ fn fn_facts(
     if sig.asyncness.is_some() {
         props.insert("is_async".into(), Value::Bool(true));
     }
+    if attrs.iter().any(is_test_attr) {
+        set_test_flag(
+            &mut props,
+            "attribute",
+            "test code: a `#[test]`-family attribute, which is the language's own marker for a function the test harness runs",
+            "definitive",
+        );
+    }
 
     let label = if receiver.is_some() {
         "Method"
@@ -4851,6 +5117,29 @@ fn fn_facts(
 
 fn ty_of(ty: &syn::Type) -> String {
     tidy(&ty.to_token_stream().to_string())
+}
+
+/// A signature's declared parameter types, as `(name, type as written)`.
+///
+/// The receiver is not one of them: `&self` names the type this method hangs
+/// off, which `HAS_METHOD` already says. A pattern that is not a plain
+/// binding (`(a, b): (u8, u8)`) is named by its position, which is all a
+/// reader can point at.
+fn sig_params(sig: &syn::Signature) -> Vec<(String, String)> {
+    sig.inputs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, arg)| {
+            let syn::FnArg::Typed(t) = arg else {
+                return None;
+            };
+            let name = match &*t.pat {
+                syn::Pat::Ident(p) => p.ident.to_string(),
+                _ => i.to_string(),
+            };
+            Some((name, written_ty(&t.ty)?))
+        })
+        .collect()
 }
 
 /// A signature's return type as receiver typing can use it — see

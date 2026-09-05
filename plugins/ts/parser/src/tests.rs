@@ -991,3 +991,119 @@ export async function main() {
         ""
     );
 }
+
+/// The three shapes the JS runners collect by default. A file that merely
+/// contains the word test in its name (`latest.ts`) is not one of them.
+#[test]
+fn test_files_are_flagged_by_the_names_runners_collect() {
+    let a = run(&tree(vec![
+        ("package.json", "{\"name\": \"p\"}"),
+        (
+            "src/util.ts",
+            "export function fmt(x: string) { return x; }\n",
+        ),
+        ("src/latest.ts", "export function newest() { return 1; }\n"),
+        (
+            "src/util.test.ts",
+            "import { fmt } from './util';\nexport function checksFmt() { return fmt('a'); }\n",
+        ),
+        (
+            "src/api.spec.ts",
+            "export function checksApi() { return 1; }\n",
+        ),
+        (
+            "src/__tests__/deep.ts",
+            "export function nested() { return 1; }\n",
+        ),
+    ]));
+
+    for key in [
+        "p/src/util.test",
+        "p/src/util.test.checksFmt",
+        "p/src/api.spec",
+        "p/src/api.spec.checksApi",
+        "p/src/__tests__/deep",
+        "p/src/__tests__/deep.nested",
+    ] {
+        assert_eq!(
+            node(&a, key).props["test_flag"]["$value"],
+            Value::from("filename"),
+            "{key}"
+        );
+        assert_eq!(
+            node(&a, key).props["_test_flag_confidence"],
+            Value::from("strong"),
+            "{key}"
+        );
+    }
+
+    for key in [
+        "p/src/util",
+        "p/src/util.fmt",
+        "p/src/latest",
+        "p/src/latest.newest",
+    ] {
+        assert!(
+            !node(&a, key).props.contains_key("test_flag"),
+            "{key} must not be flagged"
+        );
+    }
+}
+
+/// A declared type is a dependency as surely as a call is — where TypeScript
+/// wrote the annotation. Fields, parameters and returns say so, through array
+/// and generic arguments, folded to one edge per pair.
+#[test]
+fn annotated_types_become_uses_type_edges() {
+    let a = run(&tree(vec![
+        ("package.json", "{\"name\": \"p\"}"),
+        ("src/job.ts", "export class Job { id = 1; }\n"),
+        ("src/cfg.ts", "export class Cfg { n = 1; }\n"),
+        (
+            "src/pool.ts",
+            "import { Job } from './job';\nimport { Cfg } from './cfg';\nexport class Pool {\n  queue: Job[] = [];\n  index: Map<string, Cfg> = new Map();\n  label: string = '';\n}\nexport function work(c: Cfg): Job { return new Job(); }\nexport function roundTrip(c: Cfg): Cfg { return c; }\nexport function loose(x) { return x; }\n",
+        ),
+    ]));
+
+    let role = |src: &str, dst: &str| -> Option<String> {
+        a.edges
+            .iter()
+            .find(|e| e.ty == "USES_TYPE" && e.src == src && e.dst == dst)
+            .map(|e| e.props["role"]["$value"].as_str().unwrap().to_string())
+    };
+
+    // Through an array element and a generic argument.
+    assert_eq!(
+        role("p/src/pool.Pool", "p/src/job.Job").as_deref(),
+        Some("field")
+    );
+    assert_eq!(
+        role("p/src/pool.Pool", "p/src/cfg.Cfg").as_deref(),
+        Some("field")
+    );
+    assert_eq!(
+        role("p/src/pool.work", "p/src/cfg.Cfg").as_deref(),
+        Some("param")
+    );
+    assert_eq!(
+        role("p/src/pool.work", "p/src/job.Job").as_deref(),
+        Some("return")
+    );
+    assert_eq!(
+        role("p/src/pool.roundTrip", "p/src/cfg.Cfg").as_deref(),
+        Some("param, return")
+    );
+
+    // An unannotated parameter states no type — and no absence of one.
+    assert!(
+        !a.edges
+            .iter()
+            .any(|e| e.ty == "USES_TYPE" && e.src == "p/src/pool.loose"),
+        "nothing was written, so nothing is claimed"
+    );
+    for e in a.edges.iter().filter(|e| e.ty == "USES_TYPE") {
+        assert_ne!(e.src, e.dst, "never a self-loop");
+        assert!(!e.dst.ends_with("string"), "a builtin is nobody's edge");
+        assert!(!e.dst.ends_with("Map"), "a foreign type is nobody's edge");
+    }
+}
