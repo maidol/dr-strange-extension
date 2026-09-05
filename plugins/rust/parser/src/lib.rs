@@ -196,7 +196,7 @@ pub struct FileFacts {
     ///
     /// The nearest thing to name resolution a parser has: when a file says
     /// `use super::Database`, that *is* where its `impl Database` points.
-    imports: Vec<(String, String, u64)>,
+    imports: Vec<(String, String, String, u64)>,
     /// Each key's enclosing **module**, which is what resolution narrows by.
     ///
     /// Recorded rather than recovered from the key, because a trait method's
@@ -334,7 +334,7 @@ fn parse_file(path: &str, module: &str, text: &str, include_source: bool) -> Fil
     // against what the file said it imported.
     f.imports = imports
         .iter()
-        .map(|(path, line)| (module.to_string(), path.clone(), *line))
+        .map(|(name, path, line)| (module.to_string(), name.clone(), path.clone(), *line))
         .collect();
     f.reexports = reexports;
     f.module = module.to_string();
@@ -370,7 +370,7 @@ fn parse_file(path: &str, module: &str, text: &str, include_source: bool) -> Fil
 fn collect_imports(
     items: &[syn::Item],
     module: &str,
-    out: &mut Vec<(String, u64)>,
+    out: &mut Vec<(String, String, u64)>,
     reexports: &mut Vec<(String, String, String)>,
 ) {
     for item in items {
@@ -398,16 +398,18 @@ fn collect_imports(
                     );
                 }
                 let line = line_of(&u.use_token);
-                out.extend(named.into_iter().map(|(_, path)| (path, line)));
+                out.extend(named.into_iter().map(|(name, path)| (name, path, line)));
             }
-            syn::Item::ExternCrate(e) => out.push((e.ident.to_string(), line_of(&e.ident))),
+            syn::Item::ExternCrate(e) => {
+                out.push((e.ident.to_string(), e.ident.to_string(), line_of(&e.ident)))
+            }
             _ => {}
         }
     }
-    // Sorted by (path, line) then deduplicated by path: one import, its
-    // first-written line.
+    // Sorted then deduplicated by the pair: `use a::b;` and `use a::b as c;`
+    // are two names in scope, not one import written twice.
     out.sort();
-    out.dedup_by(|a, b| a.0 == b.0);
+    out.dedup_by(|a, b| (&a.0, &a.1) == (&b.0, &b.1));
     reexports.sort();
     reexports.dedup();
 }
@@ -703,11 +705,9 @@ fn walk_items(items: &[syn::Item], parent: &str, include_source: bool, f: &mut F
                     let key = format!("{parent}::{}", m.ident);
                     let mut imports = Vec::new();
                     collect_imports(inner, &key, &mut imports, &mut f.reexports);
-                    f.imports.extend(
-                        imports
-                            .iter()
-                            .map(|(path, line)| (key.clone(), path.clone(), *line)),
-                    );
+                    f.imports.extend(imports.iter().map(|(name, path, line)| {
+                        (key.clone(), name.clone(), path.clone(), *line)
+                    }));
                     f.nodes.push(Node {
                         key: key.clone(),
                         label: "Module".into(),
@@ -1996,7 +1996,7 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
         // and produces no edge rather than an invented one.
         // Grouped by the module that wrote the `use`, not by the file: an
         // inline `mod tests` has imports of its own, and they belong to it.
-        for (module, written, line) in &f.imports {
+        for (module, _, written, line) in &f.imports {
             if written.ends_with("*") {
                 // A glob names no single target, so it produces no edge. It
                 // stays in the list as written, because the file did write it.
@@ -2829,15 +2829,13 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
 /// resolution — the module tree, `use` in scope, globs, re-exports — which is a
 /// compiler's job. But a file that says `use super::Database` has *written down*
 /// where its `Database` comes from, and that is worth reading.
-fn import_index(imports: &[(String, String, u64)]) -> BTreeMap<String, String> {
+fn import_index(imports: &[(String, String, String, u64)]) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    for (_, path, _) in imports {
-        if let Some(last) = path.rsplit("::").next()
-            && last != "*"
-        {
+    for (_, name, path, _) in imports {
+        if name != "*" {
             // First writing wins: a later glob or a re-import should not
             // displace an explicit one.
-            out.entry(last.to_string()).or_insert_with(|| path.clone());
+            out.entry(name.clone()).or_insert_with(|| path.clone());
         }
     }
     out
@@ -4729,10 +4727,10 @@ fn edge_at(src: &str, dst: &str, ty: &str, line: u64) -> Edge {
 }
 
 /// The paths alone, for the `imports` property.
-fn join_imports(imports: &[(String, u64)]) -> String {
+fn join_imports(imports: &[(String, String, u64)]) -> String {
     imports
         .iter()
-        .map(|(path, _)| path.as_str())
+        .map(|(_, path, _)| path.as_str())
         .collect::<Vec<_>>()
         .join(", ")
 }

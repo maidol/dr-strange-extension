@@ -69,7 +69,8 @@ carries `_code`: the source as written, described as retrieval-only — the
 ## Resolution — the certainty line
 
 - A call written as a **path** (`fs::read(…)`, `Vec::new()`) is expanded
-  against the file's own `use` list and binds exactly; paths nothing here
+  against the file's own `use` list — by the name each `use` **introduced**,
+  so `use a::b as c` puts `c` in scope and not `b` — and binds exactly; paths nothing here
   declares become external stand-ins (that is what "this crate uses that"
   needs).
 - A **bare name** binds by scope proximity; a name with two equally-close

@@ -1645,6 +1645,52 @@ fn a_turbofish_splits_off_the_path_it_qualifies() {
     assert_eq!(split_turbofish("f::<A, B>"), ("f", Some("A")));
 }
 
+/// A renamed import is in scope under the name it introduced, and only that.
+///
+/// The index was keyed by the last segment of the path instead, so
+/// `use tokio::sync::mpsc as tmpsc;` put `mpsc` in scope and left `tmpsc`
+/// out — the one name the file can actually write. Every `tmpsc::f()` in the
+/// tree resolved to nothing, and a `mpsc::f()` nobody wrote would have
+/// resolved to something.
+#[test]
+fn a_renamed_import_is_in_scope_under_the_name_it_introduced() {
+    let t = Tree::new("import-rename");
+    t.write("Cargo.toml", "[package]\nname = \"k\"\n").write(
+        "src/lib.rs",
+        r#"
+use std::sync::mpsc as chan;
+use std::collections::HashMap as Map;
+
+pub struct Job;
+
+pub fn renamed() {
+    let (tx, rx) = chan::channel();
+    tx.send(Job);
+    rx.recv();
+    let m: Map<String, i64> = Map::new();
+    m.len();
+}
+"#,
+    );
+    let a = run(&t);
+    let called: Vec<&str> = a
+        .edges
+        .iter()
+        .filter(|e| e.src == "k::renamed" && e.ty == "CALLS")
+        .map(|e| e.dst.as_str())
+        .collect();
+    for one in [
+        "std::sync::mpsc::channel",
+        "std::sync::mpsc::Sender::send",
+        "std::sync::mpsc::Receiver::recv",
+        "std::collections::HashMap::len",
+    ] {
+        assert!(called.contains(&one), "expected {one} in {called:?}");
+    }
+    // The old spelling was never in scope and must not be invented.
+    assert!(!keys(&a).contains(&"chan::channel"), "{:?}", keys(&a));
+}
+
 // ---- P0 eval harness: known resolution gaps, un-ignored as their phase
 // lands. `just eval` runs these; CI's normal `cargo test` skips them.
 
