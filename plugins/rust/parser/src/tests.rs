@@ -12,7 +12,15 @@ struct Tree(std::path::PathBuf);
 
 impl Tree {
     fn new(name: &str) -> Self {
-        let p = std::env::temp_dir().join(format!("drsg-parser-{name}-{}", std::process::id()));
+        // A serial number as well as the name: two tests may reasonably want
+        // a tree called the same thing, and the tests run in parallel. Named
+        // by process and name alone, the second one to start wiped the first
+        // one's files mid-run and `Drop` deleted the directory it was still
+        // reading — a failure that looked like the parser losing a module.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nth = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p =
+            std::env::temp_dir().join(format!("drsg-parser-{name}-{}-{nth}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         Self(p)
