@@ -3,8 +3,8 @@
 //! every chunk's facts together, in chunk order. The result must not depend
 //! on where the chunk boundaries fell.
 
-use crate::{CallKind, Edge, FileFacts, Node, Props, edge_at};
-use serde_json::Value;
+use crate::{CallKind, Edge, FileFacts, Node, Props, Shape, edge_at};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The assembled result: facts, and an account of what could not be done.
@@ -151,6 +151,25 @@ fn note_external(
 
 pub fn assemble(all: Vec<FileFacts>) -> Assembled {
     let mut out = Assembled::default();
+
+    // Which declared keys are coroutines. `unawaited` is only true of one:
+    // a plain `print(x)` is a statement whose result is discarded too, and
+    // there is nothing there to await.
+    // One caller may reach one callee several ways — `await f()` on one line
+    // and `create_task(f())` on the next — and they fold to a single edge.
+    // The union is the honest statement: what this caller does with this
+    // callee *somewhere*, rather than whichever site the walk happened to
+    // reach first, which is how the awaited site silently swallowed the
+    // scheduled one.
+    let mut shapes: BTreeMap<(String, String), BTreeSet<&'static str>> = BTreeMap::new();
+    let mut coroutines: BTreeSet<String> = BTreeSet::new();
+    for f in &all {
+        for n in &f.nodes {
+            if n.props.get("is_async") == Some(&Value::Bool(true)) {
+                coroutines.insert(n.key.clone());
+            }
+        }
+    }
 
     // ---- indexes ----------------------------------------------------------
     let mut ix = Index {
@@ -313,6 +332,12 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
         }
     }
     let mut hint_ix: BTreeMap<(String, String), String> = BTreeMap::new();
+    // The same table for types nothing here declares. `q = asyncio.Queue()`
+    // states the type of `q` exactly as plainly as a local class would, and
+    // a queue is where Python puts what Go puts in a channel — so leaving it
+    // untyped sent every `q.put(...)` and `q.get()` to the ledger and left
+    // the producer and the consumer unrelated.
+    let mut ext_hint_ix: BTreeMap<(String, String), String> = BTreeMap::new();
     for f in &all {
         let bindings = file_bindings(f);
         for h in &f.hints {
@@ -328,9 +353,49 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
                 hint_ix
                     .entry((h.caller.clone(), h.name.clone()))
                     .or_insert(class);
+                continue;
+            }
+            // Nothing here declares it: read the written type through the
+            // file's own imports, the way a call chain is read.
+            if let Some(path) = external_type(&ix, &bindings, &h.written) {
+                ext_hint_ix
+                    .entry((h.caller.clone(), h.name.clone()))
+                    .or_insert(path);
             }
         }
     }
+    /// A written type nothing here declares, read through the file's own
+    /// imports into the path it names: `asyncio.Queue` under `import
+    /// asyncio`, `Session` under `from requests import Session`. Nothing when
+    /// the path reaches a module this tree parsed — a declaration is a better
+    /// answer and the caller already tried for one.
+    fn external_type(
+        ix: &Index,
+        bindings: &BTreeMap<String, (String, String)>,
+        written: &str,
+    ) -> Option<String> {
+        let parts: Vec<&str> = written.split('.').collect();
+        let (root, name) = (*parts.first()?, *parts.last()?);
+        let (target, member) = bindings.get(root)?;
+        let mut module = target.clone();
+        if !member.is_empty() {
+            module = format!("{module}.{member}");
+        }
+        for part in &parts[1..parts.len().saturating_sub(1)] {
+            module = format!("{module}.{part}");
+        }
+        let root_module = module.split('.').next().unwrap_or(&module).to_owned();
+        if ix.modules.contains(&module) || ix.modules.contains(&root_module) {
+            return None;
+        }
+        // `from asyncio import Queue` binds the type itself: the module is
+        // already the whole path and the last segment must not repeat.
+        if module.ends_with(&format!(".{name}")) || module == name {
+            return Some(module);
+        }
+        Some(format!("{module}.{name}"))
+    }
+
     // The method a class answers `name` with: its own, else the bases',
     // left to right depth-first — Python's resolution order, near enough
     // for declared facts.
@@ -496,6 +561,19 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
                             {
                                 how = Some(("class", "high"));
                                 Some(Some(key))
+                            } else if let Some(path) =
+                                ext_hint_ix.get(&(c.caller.clone(), root.clone()))
+                            {
+                                // A receiver whose type is std's or a
+                                // dependency's: the node is the path and the
+                                // fact it was called, which is all that is
+                                // known about it — the same stand-in a
+                                // qualified call into that module gets.
+                                let key = format!("{path}.{m}");
+                                note_external(&seen, &mut external, &key, "Method");
+                                external_calls += 1;
+                                how = Some(("external-receiver", "high"));
+                                Some(Some(key))
                             } else {
                                 None
                             }
@@ -541,7 +619,20 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
             let (strategy, band) = how.unwrap_or((strategy, band));
             match resolved {
                 Some(Some(key)) => {
-                    let mut e = edge_at(&c.caller, &key, "CALLS", c.line);
+                    let e = edge_at(&c.caller, &key, "CALLS", c.line);
+                    // Scheduling is evident from the syntax whatever the
+                    // callee is — `to_thread(sync_fn)` runs a plain function
+                    // beside its caller. Being unawaited is only a fact
+                    // about a coroutine.
+                    if let Some(shape) = c.shape
+                        && (shape == Shape::Scheduled || coroutines.contains(&key))
+                    {
+                        shapes
+                            .entry((c.caller.clone(), key.clone()))
+                            .or_default()
+                            .insert(shape.as_str());
+                    }
+                    let mut e = e;
                     e.props
                         .insert("_resolved_by".into(), Value::String(strategy.into()));
                     e.props
@@ -632,7 +723,7 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
     let mut ref_seen: BTreeSet<(String, String)> = BTreeSet::new();
     for f in &all {
         let bindings = file_bindings(f);
-        for (caller, name, line) in &f.fn_refs {
+        for (caller, name, line, handed) in &f.fn_refs {
             if BUILTINS.contains(&name.as_str()) {
                 continue;
             }
@@ -650,6 +741,15 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
                 continue;
             }
             let mut e = edge_at(caller, &target, "REFERENCES", *line);
+            if let Some(shape) = handed {
+                e.props.insert(
+                    "concurrent".into(),
+                    json!({
+                        "$desc": "handed to a scheduler, which runs it beside its caller",
+                        "$value": shape.as_str(),
+                    }),
+                );
+            }
             e.props
                 .insert("_resolved_by".into(), Value::String("fn-ref".into()));
             e.props
@@ -663,6 +763,22 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
     // node pass below would otherwise mint a second, bare node for it.
     seen.extend(unresolved_nodes.keys().cloned());
     out.nodes.extend(unresolved_nodes.into_values());
+    // The concurrency shapes, applied once per edge now that every site of
+    // every caller has been seen.
+    for e in &mut pending {
+        if e.ty != "CALLS" {
+            continue;
+        }
+        if let Some(kinds) = shapes.get(&(e.src.clone(), e.dst.clone())) {
+            e.props.insert(
+                "concurrent".into(),
+                json!({
+                    "$desc": "how control departs from waiting for this callee at one or more sites: `scheduled` runs it beside its caller, `unawaited` starts it and waits for nothing",
+                    "$value": kinds.iter().copied().collect::<Vec<_>>().join(", "),
+                }),
+            );
+        }
+    }
     out.edges = pending;
 
     // ---- implied and external nodes --------------------------------------

@@ -64,6 +64,59 @@ pub struct Call {
     pub caller: String,
     pub kind: CallKind,
     pub line: u64,
+    /// How the call site relates to the coroutine's completion, when it
+    /// departs from waiting for it — see [`Shape`]. `None` is the ordinary
+    /// case: a plain call, or an `await` that runs the callee to completion
+    /// before this body continues.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<Shape>,
+}
+
+/// What a call site says about concurrency, when it says anything.
+///
+/// Python has no channel, so the whole of its concurrency is *where control
+/// stops waiting* — and that is written at the call site, not the
+/// declaration. `is_async` on a function says it may suspend; only the call
+/// says whether anyone waited. `await f()`, `create_task(f())` and a bare
+/// `f()` are three different programs, and all three were one CALLS edge.
+///
+/// Only the departures are recorded. Inside an async body an `await` is the
+/// expectation, and marking every one of them would put a property on nearly
+/// every edge to say "nothing unusual here".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Shape {
+    /// Handed to a scheduler — `create_task`, `gather`, `to_thread` — so it
+    /// runs alongside its siblings rather than before them.
+    Scheduled,
+    /// Started and left: a coroutine called as a statement, whose result
+    /// nothing here waits for. Usually a mistake, always worth seeing.
+    Unawaited,
+}
+
+impl Shape {
+    fn as_str(self) -> &'static str {
+        match self {
+            Shape::Scheduled => "scheduled",
+            Shape::Unawaited => "unawaited",
+        }
+    }
+}
+
+/// The names that start a coroutine running beside its caller. Matched on
+/// the last dotted segment, so `asyncio.create_task`, a from-imported
+/// `create_task` and `tg.create_task` are one rule.
+pub(crate) fn schedules(name: &str) -> bool {
+    matches!(
+        name.rsplit('.').next().unwrap_or(name),
+        "create_task"
+            | "ensure_future"
+            | "gather"
+            | "to_thread"
+            | "shield"
+            | "run_in_executor"
+            | "wait"
+            | "as_completed"
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,7 +218,10 @@ pub struct FileFacts {
     pub hints: Vec<Hint>,
     /// `(caller, bare name, line)` — functions (or classes: Python's
     /// class-as-value idiom) passed as call arguments.
-    pub fn_refs: Vec<(String, String, u64)>,
+    /// `(caller, bare name, line, shape)` — a function handed as a value.
+    /// The shape is the call site's: `to_thread(work)` schedules `work`
+    /// itself, which is a concurrency fact about a name never called here.
+    pub fn_refs: Vec<(String, String, u64, Option<Shape>)>,
     /// `(function key, return annotation as written)` when it is a plain
     /// dotted name — what types `x = make()`.
     pub returns: Vec<(String, String)>,
@@ -1007,6 +1063,7 @@ impl Walker<'_> {
                 caller: decl_key.to_string(),
                 kind: CallKind::Plain(n.id.to_string()),
                 line,
+                shape: None,
             }),
             ast::Expr::Attribute(_) => {
                 if let Some(written) = dotted(expr) {
@@ -1014,6 +1071,7 @@ impl Walker<'_> {
                         caller: decl_key.to_string(),
                         kind: CallKind::Chain(written.split('.').map(str::to_string).collect()),
                         line,
+                        shape: None,
                     });
                 }
             }
@@ -1026,6 +1084,7 @@ impl Walker<'_> {
             walker: self,
             caller: caller.to_string(),
             class: class.map(str::to_string),
+            shapes: std::collections::BTreeMap::new(),
         };
         for stmt in body {
             // Through visit_stmt, not walk_stmt: the body's own top-level
@@ -1103,6 +1162,38 @@ struct CallCollector<'a, 'b> {
     walker: &'a mut Walker<'b>,
     caller: String,
     class: Option<String>,
+    /// The shape recorded for a call expression, by where it starts.
+    ///
+    /// The visit gives no parents, and the concurrency of a call is entirely
+    /// a fact about its parent: `await f()`, `create_task(f())` and a bare
+    /// `f()` differ nowhere inside the `f()`. So each parent stamps its
+    /// children on the way down, and the call reads its own stamp when the
+    /// walk reaches it.
+    shapes: std::collections::BTreeMap<u32, Shape>,
+}
+
+impl CallCollector<'_, '_> {
+    fn stamp(&mut self, e: &ast::Expr, shape: Shape) {
+        match e {
+            ast::Expr::Call(c) => {
+                self.shapes.insert(u32::from(c.range().start()), shape);
+            }
+            // `Promise.all`-shaped calls take a list: `gather(*(f(x) for …))`
+            // and `asyncio.wait([a(), b()])` schedule what is inside it.
+            ast::Expr::List(l) => {
+                for item in &l.elts {
+                    self.stamp(item, shape);
+                }
+            }
+            ast::Expr::Tuple(t) => {
+                for item in &t.elts {
+                    self.stamp(item, shape);
+                }
+            }
+            ast::Expr::Starred(st) => self.stamp(&st.value, shape),
+            _ => {}
+        }
+    }
 }
 
 impl ruff_python_ast::visitor::Visitor<'_> for CallCollector<'_, '_> {
@@ -1114,12 +1205,26 @@ impl ruff_python_ast::visitor::Visitor<'_> for CallCollector<'_, '_> {
         match stmt {
             ast::Stmt::Import(i) => self.walker.import(i),
             ast::Stmt::ImportFrom(i) => self.walker.import_from(i),
+            // A call standing alone as a statement throws its result away.
+            // For a coroutine that means nobody here waits for it — the
+            // `await` that would have is simply absent. Stamped for every
+            // callee and kept at assemble only for the ones that are async,
+            // because `print(x)` is a statement too and waits for nothing
+            // by being nothing to wait for.
+            ast::Stmt::Expr(e) => self.stamp(&e.value, Shape::Unawaited),
             _ => {}
         }
         ruff_python_ast::visitor::walk_stmt(self, stmt);
     }
 
     fn visit_expr(&mut self, expr: &ast::Expr) {
+        // `await f()` waits for the coroutine here, so it is the ordinary
+        // case and clears any `unawaited` the statement above stamped.
+        if let ast::Expr::Await(a) = expr
+            && let ast::Expr::Call(c) = &*a.value
+        {
+            self.shapes.remove(&u32::from(c.range().start()));
+        }
         // A string literal shaped like a dotted qualified name is a
         // candidate symbol reference (mock.patch("pkg.mod.fn")); it binds at
         // assemble only if something actually declares that name (P2).
@@ -1145,13 +1250,29 @@ impl ruff_python_ast::visitor::Visitor<'_> for CallCollector<'_, '_> {
         }
         if let ast::Expr::Call(call) = expr {
             let line = self.walker.line(call.range());
+            let shape = self.shapes.remove(&u32::from(call.range().start()));
+            // A scheduler starts every coroutine it is handed beside its
+            // caller — read from the name alone, which is what the source
+            // says and all it says.
+            let scheduler = dotted(&call.func).is_some_and(|n| schedules(&n))
+                || matches!(&*call.func, ast::Expr::Name(n) if schedules(&n.id));
+            if scheduler {
+                let args: Vec<ast::Expr> = call.arguments.args.to_vec();
+                for arg in &args {
+                    self.stamp(arg, Shape::Scheduled);
+                }
+            }
             for arg in &*call.arguments.args {
                 if let ast::Expr::Name(n) = arg {
                     let caller = self.caller.clone();
+                    // A scheduler is handed the callable itself here, not a
+                    // coroutine: `to_thread(work)` runs `work` beside its
+                    // caller though nothing in this body ever calls it.
+                    let handed = scheduler.then_some(Shape::Scheduled);
                     self.walker
                         .facts
                         .fn_refs
-                        .push((caller, n.id.to_string(), line));
+                        .push((caller, n.id.to_string(), line, handed));
                 }
             }
             match &*call.func {
@@ -1159,6 +1280,7 @@ impl ruff_python_ast::visitor::Visitor<'_> for CallCollector<'_, '_> {
                     caller: self.caller.clone(),
                     kind: CallKind::Plain(n.id.to_string()),
                     line,
+                    shape,
                 }),
                 ast::Expr::Attribute(at) => match dotted(&call.func) {
                     Some(written) => {
@@ -1190,6 +1312,7 @@ impl ruff_python_ast::visitor::Visitor<'_> for CallCollector<'_, '_> {
                             caller: self.caller.clone(),
                             kind,
                             line,
+                            shape,
                         });
                     }
                     // `super().m()` — a call receiver, so `dotted` refuses
@@ -1206,6 +1329,7 @@ impl ruff_python_ast::visitor::Visitor<'_> for CallCollector<'_, '_> {
                                     method: at.attr.id.to_string(),
                                 },
                                 line,
+                                shape: None,
                             });
                         } else {
                             self.walker.facts.opaque += 1;

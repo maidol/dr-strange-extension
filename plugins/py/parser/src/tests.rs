@@ -678,3 +678,120 @@ fn functions_passed_as_values_become_references() {
         "no self-loop"
     );
 }
+
+/// The `concurrent` value on a CALLS edge, or "" when it carries none.
+fn concurrency(a: &Assembled, src: &str, dst: &str) -> String {
+    a.edges
+        .iter()
+        .find(|e| e.src == src && e.ty == "CALLS" && e.dst == dst)
+        .and_then(|e| e.props.get("concurrent"))
+        .and_then(|v| v.get("$value").cloned())
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// Python has no channel, so the whole of its concurrency is where control
+/// stops waiting — and that is written at the call site, not the
+/// declaration. `is_async` says a function may suspend; only the call says
+/// whether anyone waited. `await f()`, `create_task(f())` and a bare `f()`
+/// were one indistinguishable edge.
+#[test]
+fn a_call_site_says_whether_anyone_waits_for_the_coroutine() {
+    let t = tree(vec![(
+        "app.py",
+        r#"
+import asyncio
+
+async def fetch(u): return u
+async def worker(): return 1
+def plain(): return 2
+
+async def main():
+    await fetch("a")
+    asyncio.create_task(worker())
+    await asyncio.gather(fetch("b"), fetch("c"))
+    asyncio.to_thread(plain)
+"#,
+    )]);
+    let a = run(&t);
+    // Awaited is the expectation inside an async body and says nothing;
+    // marking every one would put a property on nearly every edge.
+    assert_eq!(concurrency(&a, "app.main", "app.fetch"), "scheduled");
+    assert_eq!(concurrency(&a, "app.main", "app.worker"), "scheduled");
+    // Scheduling is evident from the syntax whatever the callee is — and a
+    // scheduler handed the callable itself rather than a coroutine runs it
+    // beside its caller though nothing in this body ever calls it.
+    let handed = a
+        .edges
+        .iter()
+        .find(|e| e.src == "app.main" && e.ty == "REFERENCES" && e.dst == "app.plain")
+        .and_then(|e| e.props.get("concurrent"))
+        .and_then(|v| v.get("$value").and_then(|v| v.as_str()));
+    assert_eq!(handed, Some("scheduled"), "{:?}", a.edges);
+}
+
+/// A coroutine called as a statement is started and left. That is the
+/// bug-prone shape, and it is the one the graph could not show at all.
+#[test]
+fn a_coroutine_nobody_awaits_is_marked_and_a_plain_call_is_not() {
+    let t = tree(vec![(
+        "app.py",
+        r#"
+async def fetch(u): return u
+def log(m): return m
+
+async def main():
+    fetch("forgotten")
+    log("fine")
+    await fetch("waited")
+"#,
+    )]);
+    let a = run(&t);
+    // One caller reaches one callee two ways and they fold to one edge, so
+    // the union is the honest statement — the awaited site must not swallow
+    // the unawaited one merely by being written first.
+    assert_eq!(concurrency(&a, "app.main", "app.fetch"), "unawaited");
+    // A statement whose result is discarded is not concurrency when there
+    // was nothing to await: `log("fine")` is simply a call.
+    assert_eq!(concurrency(&a, "app.main", "app.log"), "");
+}
+
+/// A queue is where Python puts what Go puts in a channel, and
+/// `q = asyncio.Queue()` states its type as plainly as a local class would.
+/// Untyped, every `q.put(...)` and `q.get()` went to the ledger.
+#[test]
+fn a_local_typed_by_an_external_constructor_resolves_its_methods() {
+    let t = tree(vec![(
+        "app.py",
+        r#"
+import asyncio
+
+async def consume(q: asyncio.Queue):
+    return await q.get()
+
+async def produce():
+    q = asyncio.Queue()
+    await q.put(1)
+    return q
+"#,
+    )]);
+    let a = run(&t);
+    assert!(
+        has_edge(&a, "app.produce", "CALLS", "asyncio.Queue.put"),
+        "{:?}",
+        a.edges
+            .iter()
+            .filter(|e| e.src == "app.produce")
+            .map(|e| e.dst.as_str())
+            .collect::<Vec<_>>()
+    );
+    // An annotated parameter is typed the same way, which is what joins the
+    // consumer to the queue the producer filled.
+    assert!(has_edge(&a, "app.consume", "CALLS", "asyncio.Queue.get"));
+    // And nothing lands in the ledger for either.
+    assert!(
+        !a.nodes.iter().any(|n| n.label == "UnresolvedRef"),
+        "{:?}",
+        a.nodes.iter().map(|n| &n.key).collect::<Vec<_>>()
+    );
+}

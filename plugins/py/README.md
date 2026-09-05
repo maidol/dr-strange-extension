@@ -48,8 +48,9 @@ the module declares one, else every name not underscore-prefixed.
 | Type | Meaning | `line` |
 |---|---|---|
 | `CONTAINS` | package → module (both ends parsed) → decl, class → method | declaration site |
-| `CALLS` | function → callee; **a decorator is a call written down** (`@app.route` names the router) | call / decorator site |
+| `CALLS` | function → callee; **a decorator is a call written down** (`@app.route` names the router). Carries `concurrent` when a site departs from waiting: `scheduled` (handed to `create_task`, `gather`, `to_thread`) or `unawaited` (a coroutine called as a statement, which nothing here waits for) | call / decorator site |
 | `IMPORTS` | module → module (absolute target; relative imports resolved at parse, where the module is known) | import statement |
+| `REFERENCES` | function → a function it **passes as a value** rather than calls; carries `concurrent: scheduled` when a scheduler was handed the callable itself | the argument |
 | `EXTENDS` | class → base — syntax, with a subscripted base extending what it subscripts (`Generic[T]` → `typing.Generic`) | class line |
 
 ## Resolution — the certainty line
@@ -57,6 +58,22 @@ the module declares one, else every name not underscore-prefixed.
 - `from pkg.mod import name` binds through the module set, aliases included;
   `import pkg.util` binds the root and **dotted chains walk modules step by
   step**, stopping the moment a step lands on a value.
+- **Concurrency is a fact about the call site, not the declaration.**
+  `is_async` says a function may suspend; only the call says whether anyone
+  waited, and `await f()`, `create_task(f())` and a bare `f()` are three
+  different programs. Only the departures are recorded — inside an async
+  body an `await` is the expectation. One caller reaching one callee several
+  ways folds to one edge carrying the **union** of what it does, so an
+  awaited site cannot swallow a scheduled one by being written first.
+  `unawaited` is claimed only of a coroutine: `log(x)` is a statement whose
+  result is discarded too, and there was nothing there to await.
+- A **local typed by an external constructor** resolves its methods to
+  external stand-ins: `q = asyncio.Queue()` makes `q.put(...)` a call on
+  `asyncio.Queue.put`, and an annotated parameter (`q: asyncio.Queue`) is
+  typed the same way — which is what joins a consumer to the queue a
+  producer fills. The node is the **type**, not the instance: two queues in
+  one program share it. An unannotated parameter states no type and stays in
+  the ledger, which is what Python's own checkers say of it.
 - **Relative imports are package geometry** (`from ..a import helper`),
   resolved where the file sits.
 - **Star imports** reach the target's export surface (`__all__`, else
