@@ -4,10 +4,10 @@
   "plugins": [
     {
       "name": "rust",
-      "version": "1.5.0",
+      "version": "1.6.0",
       "claims": ".rs",
-      "url": "https://github.com/wangyingsm/dr-strange-extension/releases/download/rust-v1.5.0/rust.wasm",
-      "sha256": "6ab33c136ef57e046eee9b1b7dae41fb48aae248159b6d2d5bd24db7442c0c8d",
+      "url": "https://github.com/wangyingsm/dr-strange-extension/releases/download/rust-v1.6.0/rust.wasm",
+      "sha256": "cecf2168f35460abd0bafd227f811f21eed1f0a6cd5e142cf91945fd33871e72",
       "contract": "1.0.0",
       "min_drsg": "2.0.0"
     },
