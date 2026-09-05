@@ -84,7 +84,13 @@ carries `_code`: the source as written, described as retrieval-only — the
   the tree's own enums, `let (a, b) = …`, `Node { key, .. }` and the
   parameters of `v.iter().map(|n| …)` are typed, `?`/`.unwrap()` reach a
   `Result<T>`'s `T`, a closure whose body is a chain says what `map`
-  yields, and `collect::<Vec<_>>()` is a `Vec`. A type this tree declares
+  yields, and `collect::<Vec<_>>()` is a `Vec`. A **channel constructor** is the pair
+  it returns — `let (tx, rx) = mpsc::channel()` types both halves, so
+  `tx.send(v)` and `rx.recv()` land on `mpsc::Sender::send` and
+  `mpsc::Receiver::recv` instead of the ledger; keyed by the constructor's
+  own module (`std::sync::mpsc`, `tokio::sync::mpsc`, `crossbeam::channel`),
+  so it is the same node an annotated `let rx: mpsc::Receiver<T>` resolves
+  to rather than a second spelling of one type. A type this tree declares
   lands on its own method; `T: Tr`, `impl Tr` and `dyn Tr` land on the
   trait's; a type the tree does not declare — std's, a dependency's — lands
   on an external stand-in keyed by the type that **declares** the method —

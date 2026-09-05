@@ -3488,6 +3488,59 @@ fn std_method(recv: &Ty, method: &str) -> Option<Ty> {
 /// every type honours, `T::try_from(…)`/`T::from_str(…)` are too. The
 /// receiver of the `.unwrap()`, `?` or `.map_err(…)` that follows is then
 /// known — the single most common shape left in the ledger otherwise.
+/// A path with its turbofish split off: `mpsc::channel::<Job>` is the
+/// function `mpsc::channel` applied to `Job`. Only the first type argument
+/// is returned — it is the one a channel carries.
+fn split_turbofish(path: &str) -> (&str, Option<&str>) {
+    let Some((head, args)) = path.split_once("::<") else {
+        return (path, None);
+    };
+    let args = args.strip_suffix('>').unwrap_or(args);
+    let first = match args.split_once(',') {
+        // Only a top-level comma splits arguments; `HashMap<K, V>` as the
+        // first argument carries its own.
+        Some((a, _)) if a.matches('<').count() == a.matches('>').count() => a,
+        _ => args,
+    };
+    let first = first.trim();
+    (head, (!first.is_empty()).then_some(first))
+}
+
+/// The channel constructors, whose whole point is the pair they return.
+///
+/// `let (tx, rx) = mpsc::channel();` is how every Rust channel starts, and
+/// until this table existed neither half had a type: `channel()` is external,
+/// so it had no declared return, so the tuple had no element types, so `tx`
+/// and `rx` were untyped and every `tx.send(v)` and `rx.recv()` in the tree
+/// fell into the unresolved ledger. A whole repository's message passing was
+/// invisible for want of one return type.
+///
+/// Keyed by the owner as written and expanded — `tokio::sync::mpsc::Sender`,
+/// not a bare `Sender` — so the node matches what an annotated
+/// `let tx: mpsc::Sender<T>` resolves to, instead of minting a second
+/// spelling of the same type.
+fn std_channel(owner: &str, function: &str, elem: impl Fn() -> Ty) -> Option<Ty> {
+    let short = owner.rsplit("::").next().unwrap_or(owner);
+    let pair = |s: &str, r: &str, arg: Ty| {
+        Ty::Tuple(vec![
+            Ty::ext(&format!("{owner}::{s}"), vec![arg.clone()]),
+            Ty::ext(&format!("{owner}::{r}"), vec![arg]),
+        ])
+    };
+    Some(match (short, function) {
+        // std::sync::mpsc, tokio::sync::mpsc, and the bounded/sync forms.
+        ("mpsc", "channel" | "sync_channel") => pair("Sender", "Receiver", elem()),
+        ("mpsc", "unbounded_channel") => pair("UnboundedSender", "UnboundedReceiver", elem()),
+        // tokio's one-shot, broadcast and watch pairs.
+        ("oneshot" | "broadcast" | "watch", "channel") => pair("Sender", "Receiver", elem()),
+        // crossbeam-channel and flume: `channel::unbounded()`, `flume::bounded()`.
+        ("channel" | "flume" | "crossbeam", "unbounded" | "bounded") => {
+            pair("Sender", "Receiver", elem())
+        }
+        _ => return None,
+    })
+}
+
 fn std_path_return(owner: &str, function: &str) -> Option<Ty> {
     let res = || Ty::ext("Result", vec![Ty::Unknown, Ty::Unknown]);
     Some(match (owner, function) {
@@ -3861,10 +3914,20 @@ impl Typing<'_> {
         if let Some(fk) = declared {
             return self.returned_type(&fk);
         }
-        let (owner, function) = callee.rsplit_once("::")?;
+        // `channel::<Item>()` is the function `channel` applied to `Item`;
+        // split at the last `::` with the turbofish still attached and the
+        // "function" comes out as `<Item>`, matching nothing.
+        let (path, targ) = split_turbofish(callee);
+        let (owner, function) = path.rsplit_once("::")?;
         if CONSTRUCTORS.contains(&function) {
             // Through an alias too: `Properties::new()` is a `HashMap`.
             return self.written_type(owner, module).and_then(Ty::known);
+        }
+        if let Some(ty) = std_channel(owner, function, || {
+            targ.and_then(|t| self.written_type(t, module))
+                .unwrap_or(Ty::Unknown)
+        }) {
+            return Some(ty);
         }
         let short = owner.rsplit("::").next().unwrap_or(owner);
         std_path_return(short, function)

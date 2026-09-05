@@ -1554,6 +1554,97 @@ pub fn over_chars(s: String) -> usize {
     }
 }
 
+/// A channel's two halves are typed by the pair its constructor returns.
+///
+/// `let (tx, rx) = mpsc::channel();` is how every Rust channel starts, and
+/// `channel()` is external — no declared return, so the tuple had no element
+/// types, so both halves were untyped and every `tx.send(v)` and `rx.recv()`
+/// in a tree fell into the unresolved ledger. A whole repository's message
+/// passing was invisible for want of one return type.
+#[test]
+fn channel_halves_type_their_sends_and_receives() {
+    let t = Tree::new("chan-pair");
+    t.write("Cargo.toml", "[package]\nname = \"k\"\n").write(
+        "src/lib.rs",
+        r#"
+use std::sync::mpsc;
+
+pub struct Job;
+
+pub fn std_pair() {
+    let (tx, rx) = mpsc::channel();
+    tx.send(Job);
+    rx.recv();
+}
+
+pub fn tokio_pair() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Job>();
+    tx.send(Job);
+    rx.recv();
+}
+
+pub fn crossbeam_pair() {
+    let (s, r) = crossbeam::channel::unbounded::<Job>();
+    s.send(Job);
+    r.recv();
+}
+"#,
+    );
+    let a = run(&t);
+    for (caller, sender, receiver) in [
+        (
+            "k::std_pair",
+            "std::sync::mpsc::Sender",
+            "std::sync::mpsc::Receiver",
+        ),
+        (
+            "k::tokio_pair",
+            "tokio::sync::mpsc::UnboundedSender",
+            "tokio::sync::mpsc::UnboundedReceiver",
+        ),
+        (
+            "k::crossbeam_pair",
+            "crossbeam::channel::Sender",
+            "crossbeam::channel::Receiver",
+        ),
+    ] {
+        assert!(
+            has_edge(&a, caller, "CALLS", &format!("{sender}::send")),
+            "{caller}: no send — {:?}",
+            a.edges
+                .iter()
+                .filter(|e| e.src == caller)
+                .map(|e| e.dst.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            has_edge(&a, caller, "CALLS", &format!("{receiver}::recv")),
+            "{caller}: no recv"
+        );
+    }
+    // The pair is keyed by the constructor's own module, so it is the same
+    // node an annotated `let rx: mpsc::UnboundedReceiver<T>` resolves to
+    // rather than a second spelling of one type.
+    assert!(!keys(&a).contains(&"Sender::send"), "{:?}", keys(&a));
+    every_edge_has_endpoints(&a);
+}
+
+/// A turbofish is the call's type argument, not part of its name.
+#[test]
+fn a_turbofish_splits_off_the_path_it_qualifies() {
+    assert_eq!(split_turbofish("mpsc::channel"), ("mpsc::channel", None));
+    assert_eq!(
+        split_turbofish("mpsc::channel::<Job>"),
+        ("mpsc::channel", Some("Job"))
+    );
+    // Only a top-level comma splits: the first argument may carry its own.
+    assert_eq!(
+        split_turbofish("f::<HashMap<K, V>>"),
+        ("f", Some("HashMap<K, V>"))
+    );
+    assert_eq!(split_turbofish("f::<A, B>"), ("f", Some("A")));
+}
+
 // ---- P0 eval harness: known resolution gaps, un-ignored as their phase
 // lands. `just eval` runs these; CI's normal `cargo test` skips them.
 

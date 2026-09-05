@@ -77,7 +77,12 @@ crate 名来自最近的 `Cargo.toml` 的 `[package] name`（`-` → `_`），�
   于是 `for n in &v`、`if let Some(n) = …`、对本树枚举的 `match` 分支、
   `let (a, b) = …`、`Node { key, .. }` 和 `v.iter().map(|n| …)` 的闭包参数
   都有类型，`?`/`.unwrap()` 抵达 `Result<T>` 的 `T`，函数体是链式表达式的
-  闭包说明 `map` 产出什么，`collect::<Vec<_>>()` 是 `Vec`。本树声明的类型
+  闭包说明 `map` 产出什么，`collect::<Vec<_>>()` 是 `Vec`。**通道构造器**即它返回的那一对——
+  `let (tx, rx) = mpsc::channel()` 为两半都定了类型，于是 `tx.send(v)` 与
+  `rx.recv()` 落到 `mpsc::Sender::send` 与 `mpsc::Receiver::recv`，而非账本；
+  键取自构造器自身的模块（`std::sync::mpsc`、`tokio::sync::mpsc`、
+  `crossbeam::channel`），因此与带注解的 `let rx: mpsc::Receiver<T>` 解析到
+  同一个节点，不会为同一类型另铸一种拼写。本树声明的类型
   落到它自己的方法上；`T: Tr`、`impl Tr` 与 `dyn Tr` 落到 trait 的方法上；
   本树未声明的类型——std 的、依赖的——落到外部替身上，其键取**声明**该方法
   的类型：`Vec::push`、`str::trim`、`Clone::clone`，以及每个通过 trait 作答
