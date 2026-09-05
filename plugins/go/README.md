@@ -51,9 +51,11 @@ node it could only be a key collision, and its calls are wiring, not API.
 |---|---|---|
 | `CONTAINS` | package → decl, receiver type → method | declaration site |
 | `HAS_METHOD` | interface → its demanded methods | member's line |
-| `CALLS` | function → callee | call site |
+| `CALLS` | function → callee. A `go f()` carries `concurrent` on the edge: control does reach the callee, but on another goroutine, and a graph that cannot tell the two apart describes a different program | call site |
 | `IMPORTS` | package → package (in-tree or external) | import statement |
 | `IMPLEMENTS` | type → interface — **no line**, deliberately: satisfaction is structural in Go; nothing is written anywhere |
+| `SENDS` | function → a channel it writes to (`ch <- v`) | the send |
+| `RECEIVES` | function → a channel it reads from (`<-ch`, `range ch`, a `select` case) | the receive |
 
 ## Resolution — the certainty line
 
@@ -64,6 +66,18 @@ node it could only be a key collision, and its calls are wiring, not API.
   respected, the tree's real package names beating directory names.
 - A **method call on a value** names no package, and the receiver's type is
   what a parser cannot know: counted.
+- A **channel** is the one value whose purpose is to join code that never
+  calls itself, so it becomes a node of its own — keyed under whatever made
+  it (`pkg.Producer.ch`, or `pkg.ch` for a package-level var, which the
+  channel adopts rather than doubling) and carrying its element type and
+  buffer size. `ch <- v` and `<-ch` are `SENDS`/`RECEIVES`; `range x` says
+  nothing about being a channel, so it is kept only when the name is one.
+  A channel **handed to a function** binds to that function's parameter by
+  position, transitively and once per call site — which is what puts a
+  producer and a consumer two hops apart instead of leaving them unrelated.
+  Only a **bare name** is followed: `s.ch <- v` names a field, and which
+  channel that is depends on which `s` — a question this parser cannot
+  answer, and answering it wrong would join two goroutines that never meet.
 - **Interface satisfaction** is decided structurally, under certainty rules:
   textual signature equality within a package; across packages only when
   both signatures are spelled entirely in predeclared types (a local `Thing`

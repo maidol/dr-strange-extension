@@ -71,6 +71,51 @@ type Call struct {
 	Alias  string `json:"alias,omitempty"`
 	Name   string `json:"name"`
 	Line   int    `json:"line,omitempty"`
+	// Concurrent marks `go f()`. Control does reach the callee, so this is
+	// still a CALLS edge — but it reaches it on another goroutine, and a
+	// reader who cannot tell the two apart is reading the wrong program.
+	Concurrent bool `json:"concurrent,omitempty"`
+	// Args are the arguments as bare names, by position ("" for anything
+	// that is not a plain identifier). Handing a channel to a function is
+	// how one goroutine's channel becomes another's, and the position is
+	// what joins the argument to the parameter it lands on.
+	Args []string `json:"args,omitempty"`
+}
+
+// ChanParam is one channel-typed parameter of a declared function: which
+// function, which position, and the name the body knows it by.
+type ChanParam struct {
+	Fn    string `json:"fn"`
+	Index int    `json:"index"`
+	Name  string `json:"name"`
+}
+
+// Chan is one channel a body makes: `ch := make(chan T, n)`. Owner is the
+// function key it was made in, or "" for a package-level var, whose scope is
+// the whole package.
+//
+// A channel is the one value in Go whose whole purpose is to join two pieces
+// of code that never call each other. Nothing else in the graph can carry
+// that: `ch <- v` names no function, and the goroutine on the other end is
+// reached through the variable alone.
+type Chan struct {
+	Owner string `json:"owner,omitempty"`
+	Name  string `json:"name"`
+	Elem  string `json:"elem,omitempty"`
+	Buf   string `json:"buf,omitempty"`
+	Line  int    `json:"line,omitempty"`
+}
+
+// ChanOp is one send or receive written on a name, held until [Assemble]
+// knows which names are channels. `ch <- v` and `<-ch` say so outright;
+// `range x` does not, so it is recorded as a candidate and kept only when
+// the name turns out to be a channel.
+type ChanOp struct {
+	Caller string `json:"caller"`
+	Name   string `json:"name"`
+	// "SENDS" or "RECEIVES".
+	Op   string `json:"op"`
+	Line int    `json:"line,omitempty"`
 }
 
 // Hint records how a body (or the package scope) binds a name to a type the
@@ -166,6 +211,13 @@ type FileFacts struct {
 	// FnRefs are functions passed as values: `register(handler)` —
 	// (caller, bare name, line), argument position only.
 	FnRefs []FnRef `json:"fn_refs,omitempty"`
+	// Chans are the channels this file's bodies make; ChanOps the sends and
+	// receives written on a name, resolved against them in [Assemble].
+	Chans   []Chan   `json:"chans,omitempty"`
+	ChanOps []ChanOp `json:"chan_ops,omitempty"`
+	// ChanParams are the channel-typed parameters each function declares —
+	// where a caller's channel arrives under a new name.
+	ChanParams []ChanParam `json:"chan_params,omitempty"`
 	// Call sites too dynamic to name at all — `f()()`, chained selectors —
 	// counted so the notes can account for them.
 	Opaque int `json:"opaque,omitempty"`
@@ -373,6 +425,7 @@ func (w *walker) funcDecl(d *ast.FuncDecl) {
 	}
 	w.node(parent, key, label, props, w.line(d))
 	w.calls(key, d.Body)
+	w.chans(key, d.Body)
 
 	// Receiver-typing inputs: the declared first result (what `x := f()`
 	// makes x), the typed parameters, and the body's own stated bindings.
@@ -388,15 +441,30 @@ func (w *walker) funcDecl(d *ast.FuncDecl) {
 		}
 	}
 	if d.Type.Params != nil {
+		pos := 0
 		for _, field := range d.Type.Params.List {
-			alias, tname, ok := typeRef(field.Type)
-			if !ok {
+			// A channel-typed parameter is where a caller's channel arrives
+			// under a new name — `chan T`, `<-chan T` and `chan<- T` alike.
+			if _, isChan := field.Type.(*ast.ChanType); isChan {
+				for _, id := range field.Names {
+					if id.Name != "_" {
+						w.facts.ChanParams = append(w.facts.ChanParams, ChanParam{
+							Fn: key, Index: pos, Name: id.Name,
+						})
+					}
+					pos++
+				}
 				continue
 			}
+			alias, tname, ok := typeRef(field.Type)
 			for _, id := range field.Names {
-				if id.Name != "_" {
+				if ok && id.Name != "_" {
 					w.hint(Hint{Caller: key, Name: id.Name, TypeAlias: alias, TypeName: tname})
 				}
+				pos++
+			}
+			if len(field.Names) == 0 {
+				pos++ // an unnamed parameter still occupies its position
 			}
 		}
 	}
@@ -525,6 +593,16 @@ func (w *walker) valueSpec(d *ast.GenDecl, s *ast.ValueSpec, values []ast.Expr, 
 			if id.Name == "_" {
 				continue
 			}
+			// A package-level `var ch = make(chan T)` is in scope for every
+			// function in the package, and is the shape a worker pool most
+			// often takes. Owner "" says exactly that.
+			if i < len(values) {
+				if elem, buf, ok := w.chanMake(values[i]); ok {
+					w.facts.Chans = append(w.facts.Chans, Chan{
+						Name: id.Name, Elem: elem, Buf: buf, Line: w.line(s),
+					})
+				}
+			}
 			if typ != nil {
 				if alias, tname, ok := typeRef(typ); ok {
 					w.hint(Hint{Name: id.Name, TypeAlias: alias, TypeName: tname})
@@ -574,26 +652,150 @@ func (w *walker) calls(caller string, body *ast.BlockStmt) {
 	if body == nil {
 		return
 	}
+	// Which calls a `go` starts. The visit gives no parents, so the go
+	// statements are collected first and the call sites checked against
+	// them — `go f()` is one CallExpr, the same node the walk below reaches
+	// on its own.
+	spawned := map[*ast.CallExpr]bool{}
+	ast.Inspect(body, func(n ast.Node) bool {
+		if g, ok := n.(*ast.GoStmt); ok && g.Call != nil {
+			spawned[g.Call] = true
+		}
+		return true
+	})
 	ast.Inspect(body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
 			return true
 		}
+		// The arguments as bare names, by position — the only shape in
+		// which a channel is verifiably handed to another function.
+		args := make([]string, len(call.Args))
+		bare := false
+		for i, arg := range call.Args {
+			if id, ok := arg.(*ast.Ident); ok {
+				args[i] = id.Name
+				bare = true
+				w.facts.FnRefs = append(w.facts.FnRefs, FnRef{Caller: caller, Name: id.Name, Line: w.line(call)})
+			}
+		}
+		if !bare {
+			args = nil
+		}
+		site := Call{Caller: caller, Line: w.line(call), Concurrent: spawned[call], Args: args}
 		switch fn := call.Fun.(type) {
 		case *ast.Ident:
-			w.facts.Calls = append(w.facts.Calls, Call{Caller: caller, Name: fn.Name, Line: w.line(call)})
+			site.Name = fn.Name
+			w.facts.Calls = append(w.facts.Calls, site)
 		case *ast.SelectorExpr:
 			if x, ok := fn.X.(*ast.Ident); ok {
-				w.facts.Calls = append(w.facts.Calls, Call{Caller: caller, Alias: x.Name, Name: fn.Sel.Name, Line: w.line(call)})
+				site.Alias, site.Name = x.Name, fn.Sel.Name
+				w.facts.Calls = append(w.facts.Calls, site)
 			} else {
 				w.facts.Opaque++
 			}
 		default:
 			w.facts.Opaque++
 		}
-		for _, arg := range call.Args {
-			if id, ok := arg.(*ast.Ident); ok {
-				w.facts.FnRefs = append(w.facts.FnRefs, FnRef{Caller: caller, Name: id.Name, Line: w.line(call)})
+		return true
+	})
+}
+
+// chanMake reads `make(chan T, n)` off an initializer, returning the element
+// type and the buffer size as written. Anything else — including a channel
+// obtained from a call — is not a make and states no element type here.
+func (w *walker) chanMake(e ast.Expr) (elem, buf string, ok bool) {
+	call, ok := e.(*ast.CallExpr)
+	if !ok {
+		return "", "", false
+	}
+	if id, ok := call.Fun.(*ast.Ident); !ok || id.Name != "make" || len(call.Args) == 0 {
+		return "", "", false
+	}
+	ct, ok := call.Args[0].(*ast.ChanType)
+	if !ok {
+		return "", "", false
+	}
+	elem = w.print(ct.Value)
+	if len(call.Args) > 1 {
+		buf = w.print(call.Args[1])
+	}
+	return elem, buf, true
+}
+
+// chans records the channels a body makes and every send or receive it
+// writes on a name.
+//
+// Only a bare name is followed. `s.ch <- v` names a field, and which channel
+// that is depends on which `s` — a question this parser cannot answer, and
+// answering it wrong would join two goroutines that never meet.
+func (w *walker) chans(caller string, body *ast.BlockStmt) {
+	if body == nil {
+		return
+	}
+	op := func(name string, kind string, n ast.Node) {
+		w.facts.ChanOps = append(w.facts.ChanOps, ChanOp{
+			Caller: caller, Name: name, Op: kind, Line: w.line(n),
+		})
+	}
+	bare := func(e ast.Expr) (string, bool) {
+		id, ok := e.(*ast.Ident)
+		if !ok || id.Name == "_" {
+			return "", false
+		}
+		return id.Name, true
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch s := n.(type) {
+		case *ast.AssignStmt:
+			// `ch := make(chan T)`, and the same in a `var` inside a body.
+			for i, lhs := range s.Lhs {
+				if i >= len(s.Rhs) {
+					break
+				}
+				name, ok := bare(lhs)
+				if !ok {
+					continue
+				}
+				if elem, buf, ok := w.chanMake(s.Rhs[i]); ok {
+					w.facts.Chans = append(w.facts.Chans, Chan{
+						Owner: caller, Name: name, Elem: elem, Buf: buf, Line: w.line(s),
+					})
+				}
+			}
+		case *ast.ValueSpec:
+			for i, id := range s.Names {
+				if i >= len(s.Values) || id.Name == "_" {
+					continue
+				}
+				if elem, buf, ok := w.chanMake(s.Values[i]); ok {
+					w.facts.Chans = append(w.facts.Chans, Chan{
+						Owner: caller, Name: id.Name, Elem: elem, Buf: buf, Line: w.line(s),
+					})
+				}
+			}
+		case *ast.SendStmt:
+			// `ch <- v`. Only a channel can be sent on, so no confirmation
+			// against the channel table is needed for the *kind* of fact —
+			// only for which channel it names.
+			if name, ok := bare(s.Chan); ok {
+				op(name, "SENDS", s)
+			}
+		case *ast.UnaryExpr:
+			// `<-ch`, wherever it appears: an expression, a statement, the
+			// right of a `case v := <-ch` in a select.
+			if s.Op == token.ARROW {
+				if name, ok := bare(s.X); ok {
+					op(name, "RECEIVES", s)
+				}
+			}
+		case *ast.RangeStmt:
+			// `for v := range ch` drains a channel — but `range` also walks
+			// slices, maps and strings, and the syntax does not say which.
+			// Recorded as a candidate; [Assemble] keeps it only if the name
+			// is a channel.
+			if name, ok := bare(s.X); ok {
+				op(name, "RECEIVES", s)
 			}
 		}
 		return true

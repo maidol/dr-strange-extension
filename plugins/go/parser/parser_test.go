@@ -855,3 +855,151 @@ func TestAValueIsTheSourceAsWritten(t *testing.T) {
 		t.Fatalf("a selector chain reads back whole: %q", v.Props["value"])
 	}
 }
+
+// hasNode reports whether a key was emitted with the given label.
+func hasNode(a Assembled, key, label string) bool {
+	for _, n := range a.Nodes {
+		if n.Key == key && n.Label == label {
+			return true
+		}
+	}
+	return false
+}
+
+// A `go f()` reaches f, but on another goroutine. Both facts have to survive:
+// dropping the CALLS edge would cost every reader the reachability, and
+// leaving it unmarked describes a different program than the one on disk.
+func TestGoStatementsAreMarkedConcurrent(t *testing.T) {
+	a := run(t, mapFiles{files: map[string]string{
+		"go.mod": "module m\n",
+		"a.go":   "package m\n\nfunc work() {}\n\nfunc Run() {\n\tgo work()\n}\n\nfunc Plain() {\n\twork()\n}\n",
+	}})
+	if !hasEdge(a, "m.Run", "CALLS", "m.work") || !hasEdge(a, "m.Plain", "CALLS", "m.work") {
+		t.Fatalf("both must still call: %v", a.Edges)
+	}
+	concurrent := func(src string) bool {
+		for _, e := range a.Edges {
+			if e.Src == src && e.Type == "CALLS" && e.Dst == "m.work" {
+				_, ok := e.Props["concurrent"]
+				return ok
+			}
+		}
+		return false
+	}
+	if !concurrent("m.Run") {
+		t.Fatalf("`go work()` must be marked concurrent")
+	}
+	if concurrent("m.Plain") {
+		t.Fatalf("a plain call must not be marked concurrent")
+	}
+}
+
+// A channel is the one value in Go whose purpose is to join code that never
+// calls itself, so it gets a node and the sends and receives get edges.
+// `range` over anything else is not a receive, and must not become one.
+func TestChannelsBecomeNodesWithSendsAndReceives(t *testing.T) {
+	a := run(t, mapFiles{files: map[string]string{
+		"go.mod": "module m\n",
+		"a.go": `package m
+
+func Producer() {
+	ch := make(chan int, 4)
+	ch <- 1
+	v := <-ch
+	_ = v
+	items := []string{"a"}
+	for _, s := range items {
+		_ = s
+	}
+}
+`,
+	}})
+	if !hasNode(a, "m.Producer.ch", "Channel") {
+		t.Fatalf("the channel must be a node: %v", a.Nodes)
+	}
+	if !hasEdge(a, "m.Producer", "CONTAINS", "m.Producer.ch") {
+		t.Fatalf("the channel belongs to the body that made it: %v", a.Edges)
+	}
+	if !hasEdge(a, "m.Producer", "SENDS", "m.Producer.ch") {
+		t.Fatalf("`ch <- 1` must be a SENDS: %v", a.Edges)
+	}
+	if !hasEdge(a, "m.Producer", "RECEIVES", "m.Producer.ch") {
+		t.Fatalf("`<-ch` must be a RECEIVES: %v", a.Edges)
+	}
+	for _, e := range a.Edges {
+		if e.Type == "RECEIVES" && e.Dst != "m.Producer.ch" {
+			t.Fatalf("`range` over a slice is not a receive: %v", e)
+		}
+	}
+	for _, n := range a.Nodes {
+		if n.Key == "m.Producer.ch" {
+			if n.Props["element"] == nil || n.Props["buffer"] == nil {
+				t.Fatalf("element type and buffer size are the channel: %v", n.Props)
+			}
+		}
+	}
+}
+
+// The hop that makes the graph hold the relation at all: the producer keeps
+// the `make` and the consumer only ever sees a parameter, so without
+// following the argument across they sit in one graph with nothing between
+// them. Fan-in is ordinary Go, so a parameter binds once per call site.
+func TestAChannelHandedOverJoinsProducerToConsumer(t *testing.T) {
+	a := run(t, mapFiles{files: map[string]string{
+		"go.mod": "module m\n",
+		"a.go": `package m
+
+func drain(ch chan int) {
+	for v := range ch {
+		_ = v
+	}
+}
+
+func relay(ch chan int) { drain(ch) }
+
+func A() {
+	a := make(chan int)
+	go drain(a)
+	a <- 1
+}
+
+func B() {
+	b := make(chan int)
+	relay(b)
+}
+`,
+	}})
+	if !hasEdge(a, "m.A", "SENDS", "m.A.a") {
+		t.Fatalf("the producer sends on its own channel: %v", a.Edges)
+	}
+	if !hasEdge(a, "m.drain", "RECEIVES", "m.A.a") {
+		t.Fatalf("a channel passed to a goroutine reaches its body: %v", a.Edges)
+	}
+	// Two hops: B makes it, relay is handed it, drain is handed it again.
+	if !hasEdge(a, "m.drain", "RECEIVES", "m.B.b") {
+		t.Fatalf("a channel passed on again still reaches: %v", a.Edges)
+	}
+	// And a name that never held a channel stays out of it.
+	if hasNode(a, "m.relay.ch", "Channel") {
+		t.Fatalf("a parameter is not a channel of its own: %v", a.Nodes)
+	}
+}
+
+// A package-level channel is already a declared var. Two nodes for one
+// variable would be a lie about the program, so the declaration is adopted:
+// it keeps its key and line and gains what being a channel adds.
+func TestAPackageLevelChannelAdoptsItsDeclaration(t *testing.T) {
+	a := run(t, mapFiles{files: map[string]string{
+		"go.mod": "module m\n",
+		"a.go":   "package m\n\nvar Queue = make(chan string)\n\nfunc Push() { Queue <- \"x\" }\nfunc Pop() { <-Queue }\n",
+	}})
+	if !hasNode(a, "m.Queue", "Channel") {
+		t.Fatalf("the var becomes the channel node: %v", a.Nodes)
+	}
+	if hasNode(a, "m.Queue", "Var") {
+		t.Fatalf("one variable, one node: %v", a.Nodes)
+	}
+	if !hasEdge(a, "m.Push", "SENDS", "m.Queue") || !hasEdge(a, "m.Pop", "RECEIVES", "m.Queue") {
+		t.Fatalf("a package-level channel is in scope for the package: %v", a.Edges)
+	}
+}

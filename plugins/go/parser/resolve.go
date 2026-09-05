@@ -3,6 +3,7 @@ package parser
 import (
 	"fmt"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -32,6 +33,19 @@ func stamped(src, dst string, line int, strategy, band, written string) Edge {
 		"_confidence":  band,
 		"_ref":         written,
 	}}
+}
+
+// spawns marks a CALLS edge that a `go` statement wrote. It stays a CALLS
+// edge — control does reach the callee, and dropping that would cost every
+// reader the reachability — but a caller and a goroutine are not the same
+// fact, and a graph that cannot tell them apart describes a different
+// program than the one on disk.
+func spawns(e Edge) Edge {
+	e.Props["concurrent"] = map[string]any{
+		"$desc":  "started with `go`: control reaches the callee on another goroutine, not in this one",
+		"$value": true,
+	}
+	return e
 }
 
 // aliasTable is one file's import table: local name → import path.
@@ -339,6 +353,17 @@ func Assemble(all []FileFacts) Assembled {
 
 	// Calls, against each file's own import table.
 	unresolved, externalCalls := 0, 0
+	chans, goroutines := 0, 0
+	chanSeen := map[string]bool{}
+	// Where a bare name was handed to an in-tree callee: (caller, callee,
+	// argument names by position). A channel argument becomes the callee's
+	// channel, which is the only way the graph can join a producer to a
+	// consumer that never call each other.
+	type handover struct {
+		caller, callee string
+		args           []string
+	}
+	var handovers []handover
 	for fi := range all {
 		f := &all[fi]
 		if f.Failed {
@@ -379,13 +404,21 @@ func Assemble(all []FileFacts) Assembled {
 		}
 		unresolved += f.Opaque
 		for _, c := range f.Calls {
+			mark := func(e Edge) Edge { return e }
+			if c.Concurrent {
+				mark = spawns
+				goroutines++
+			}
 			if c.Alias == "" {
 				if builtins[c.Name] {
 					continue
 				}
 				d := forPkg(f.PkgPath)
 				if key, ok := d.funcs[c.Name]; ok {
-					addEdge(stamped(c.Caller, key, c.Line, "package", "high", c.Name))
+					addEdge(mark(stamped(c.Caller, key, c.Line, "package", "high", c.Name)))
+					if len(c.Args) > 0 {
+						handovers = append(handovers, handover{c.Caller, key, c.Args})
+					}
 				} else if !d.types[c.Name] { // a conversion is not a call
 					unresolved++
 					ledger(f, c.Caller, c.Name, c.Line, "name not declared in this package")
@@ -400,7 +433,10 @@ func Assemble(all []FileFacts) Assembled {
 				written := c.Alias + "." + c.Name
 				if tk, ok := typeOf(c.Caller, c.Alias, 6); ok {
 					if mk, strategy, band, ok := methodFor(tk, c.Name, 4); ok {
-						addEdge(stamped(c.Caller, mk, c.Line, strategy, band, written))
+						addEdge(mark(stamped(c.Caller, mk, c.Line, strategy, band, written)))
+						if len(c.Args) > 0 {
+							handovers = append(handovers, handover{c.Caller, mk, c.Args})
+						}
 						continue
 					}
 				}
@@ -410,7 +446,10 @@ func Assemble(all []FileFacts) Assembled {
 			}
 			if d, ok := pkgs[target]; ok {
 				if key, ok := d.funcs[c.Name]; ok {
-					addEdge(stamped(c.Caller, key, c.Line, "import", "high", c.Alias+"."+c.Name))
+					addEdge(mark(stamped(c.Caller, key, c.Line, "import", "high", c.Alias+"."+c.Name)))
+					if len(c.Args) > 0 {
+						handovers = append(handovers, handover{c.Caller, key, c.Args})
+					}
 				} else if !d.types[c.Name] {
 					unresolved++
 					ledger(f, c.Caller, c.Alias+"."+c.Name, c.Line, "not declared in "+target)
@@ -419,8 +458,156 @@ func Assemble(all []FileFacts) Assembled {
 			}
 			key := target + "." + c.Name
 			note(key, "Function")
-			addEdge(stamped(c.Caller, key, c.Line, "external-path", "high", c.Alias+"."+c.Name))
+			addEdge(mark(stamped(c.Caller, key, c.Line, "external-path", "high", c.Alias+"."+c.Name)))
 			externalCalls++
+		}
+	}
+
+	// Channels. A channel is where Go puts the join between two pieces of
+	// code that never call each other, so without it the graph simply does
+	// not hold the relation: `ch <- v` names no function, and the goroutine
+	// draining the other end is reached through the variable alone.
+	//
+	// The channel becomes a node of its own, keyed under whatever made it —
+	// `pkg.Producer.ch` for a local, `pkg.ch` for a package-level var. That
+	// is safe as a key because Go's own package scope forbids a func and a
+	// type sharing a name, so `pkg.Producer.ch` cannot also be a method.
+	// owner \x00 name → the channel node(s) that name stands for. A list,
+	// not one key: a parameter is bound once per call site that passes a
+	// channel to it, and fan-in — two producers, one worker — is ordinary
+	// Go. Keeping only the first would report the worker as draining one
+	// producer and not the other.
+	chanKey := map[string][]string{}
+	for fi := range all {
+		f := &all[fi]
+		if f.Failed {
+			continue
+		}
+		for _, c := range f.Chans {
+			owner := c.Owner
+			if owner == "" {
+				owner = f.PkgPath
+			}
+			key := owner + "." + c.Name
+			if chanSeen[key] {
+				continue
+			}
+			chanSeen[key] = true
+			props := Props{"name": c.Name}
+			if c.Elem != "" {
+				props["element"] = map[string]any{
+					"$desc":  "what the channel carries",
+					"$value": c.Elem,
+				}
+			}
+			if c.Buf != "" {
+				props["buffer"] = map[string]any{
+					"$desc":  "declared capacity; unbuffered when absent, so every send blocks for a receiver",
+					"$value": c.Buf,
+				}
+			}
+			// A package-level channel is already a declared `Var` node. Two
+			// nodes for one variable would be a lie about the program, so
+			// the declaration is adopted rather than duplicated: it keeps
+			// its key, its file and its line, and gains what being a channel
+			// adds. A local has no declaration of its own and gets one.
+			if at, taken := seen[key]; taken {
+				if out.Nodes[at].Label != "Var" {
+					continue // some other declaration owns the name
+				}
+				out.Nodes[at].Label = "Channel"
+				for k, v := range props {
+					if _, has := out.Nodes[at].Props[k]; !has {
+						out.Nodes[at].Props[k] = v
+					}
+				}
+			} else {
+				out.Nodes = append(out.Nodes, Node{Key: key, Label: "Channel", Props: props})
+				seen[key] = len(out.Nodes) - 1
+				addEdge(Edge{Src: owner, Dst: key, Type: "CONTAINS", Line: c.Line})
+			}
+			chanKey[c.Owner+"\x00"+c.Name] = []string{key}
+			chans++
+		}
+	}
+	// A channel handed to a function becomes that function's channel.
+	//
+	// This is the hop that makes the graph hold the relation at all. The
+	// producer usually keeps the `make` and the consumer only ever sees a
+	// parameter, so without following the argument across, `Producer` and
+	// `worker` sit in the same graph with nothing between them — which is
+	// the opposite of what the code says. Position joins them: argument `i`
+	// of the call lands on parameter `i` of the callee, and the callee's own
+	// name for it is what its body writes.
+	//
+	// Repeated to a fixpoint, because a channel is often passed on again;
+	// bounded because a cycle of mutually-recursive passers must not spin.
+	chanParams := map[string]ChanParam{} // fn \x00 index → param
+	for fi := range all {
+		for _, cp := range all[fi].ChanParams {
+			chanParams[cp.Fn+"\x00"+fmt.Sprint(cp.Index)] = cp
+		}
+	}
+	for round := 0; round < 8; round++ {
+		grew := false
+		for _, h := range handovers {
+			for i, arg := range h.args {
+				if arg == "" {
+					continue
+				}
+				cp, ok := chanParams[h.callee+"\x00"+fmt.Sprint(i)]
+				if !ok {
+					continue
+				}
+				nodes, ok := chanKey[h.caller+"\x00"+arg]
+				if !ok {
+					if nodes, ok = chanKey["\x00"+arg]; !ok {
+						continue
+					}
+				}
+				slot := h.callee + "\x00" + cp.Name
+				for _, node := range nodes {
+					if slices.Contains(chanKey[slot], node) {
+						continue
+					}
+					chanKey[slot] = append(chanKey[slot], node)
+					grew = true
+				}
+			}
+		}
+		if !grew {
+			break
+		}
+	}
+
+	// Sends and receives, once the channel names are known. A name that is
+	// no channel here is dropped in silence: `range` over a slice reaches
+	// this loop too, and most names in a body are ordinary values.
+	for fi := range all {
+		f := &all[fi]
+		if f.Failed {
+			continue
+		}
+		for _, o := range f.ChanOps {
+			keys, ok := chanKey[o.Caller+"\x00"+o.Name]
+			if !ok {
+				// Not made in this body, and no channel arrived under the
+				// name: a package-level channel, in scope for every function
+				// in the package that declares it.
+				if keys, ok = chanKey["\x00"+o.Name]; !ok {
+					continue
+				}
+				if !strings.HasPrefix(o.Caller, f.PkgPath+".") {
+					continue
+				}
+			}
+			for _, key := range keys {
+				addEdge(Edge{Src: o.Caller, Dst: key, Type: o.Op, Line: o.Line, Props: Props{
+					"_resolved_by": "chan-name",
+					"_confidence":  "high",
+					"_ref":         o.Name,
+				}})
+			}
 		}
 	}
 
@@ -513,6 +700,14 @@ func Assemble(all []FileFacts) Assembled {
 	if externalCalls > 0 {
 		out.Notes = append(out.Notes, fmt.Sprintf(
 			"%d call(s) into other modules and the standard library, recorded as external nodes carrying the import path and nothing else", externalCalls))
+	}
+	if chans > 0 {
+		out.Notes = append(out.Notes, fmt.Sprintf(
+			"%d channel(s) recorded as nodes, with the sends and receives written on their names — including in a function the channel was handed to, joined by argument position; a channel reached through a struct field is not one of them", chans))
+	}
+	if goroutines > 0 {
+		out.Notes = append(out.Notes, fmt.Sprintf(
+			"%d call(s) started with `go`, marked `concurrent` on the CALLS edge", goroutines))
 	}
 	if dupes > 0 {
 		out.Notes = append(out.Notes, fmt.Sprintf(
