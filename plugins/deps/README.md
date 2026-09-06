@@ -92,22 +92,19 @@ would like, and refusing the whole ingest over one would be absurd.
 
 ## Catalog entry
 
-The release workflow writes `version`, `url` and `sha256` into `catalog.json`
-for a plugin that is already listed there, and refuses to invent a row for one
-that is not — `claims` and `min_drsg` are judgements, not mechanics. This
-plugin's row is not in the catalog yet, because neither field can be stated
-honestly before its first release: the hash is the published artifact's, and
-the host that dispatches a manifest filename to `deps` is unreleased. Add it
-by hand alongside the `deps-v1.0.0` tag:
+Listed as `deps@1.0.0`. Two of its fields are judgements the release workflow
+will not make, and they are worth stating:
 
-| field | value |
-|---|---|
-| `claims` | `build manifests` — the extension column is prose here, as it is for `git`, because neither plugin is reached by extension |
-| `min_drsg` | `2.7.0` — the release that routes a manifest filename to this plugin. Under an older host nothing would ever be handed to it |
+| field | value | why |
+|---|---|---|
+| `claims` | `build manifests` | the column is prose here, as it is for `git`, because neither plugin is reached by an extension |
+| `min_drsg` | `2.7.0` | the release that routes a manifest filename to this plugin. Under an older host nothing would ever be handed to it, so the entry would be a promise it could not keep |
 
-Until that row exists the artifact still installs by URL; it is only
-`drsg plugin install deps`, which resolves a name through the catalog, that
-needs it.
+An older host does not hide the entry — it shows it and says `needs drsg >=
+2.7.0, this is <yours>`, because a catalog that silently omitted a plugin
+would leave you debugging why `drsg plugin install` never offers it. The
+artifact installs by URL on any host that speaks contract `1.0.0`; it simply
+has nothing to read until the host knows to hand it a manifest.
 
 ## Build & test
 

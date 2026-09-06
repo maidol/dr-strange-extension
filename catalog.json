@@ -82,6 +82,15 @@
       "sha256": "ce50d72fcfa5ad755b36a574c3cb4a37ede2837aa5ef579167b2aefdd0a3cd52",
       "contract": "1.0.0",
       "min_drsg": "2.2.0"
+    },
+    {
+      "name": "deps",
+      "version": "1.0.0",
+      "claims": "build manifests",
+      "url": "https://github.com/wangyingsm/dr-strange-extension/releases/download/deps-v1.0.0/deps.wasm",
+      "sha256": "2f93d9bac5e1709935660f7a574c214b024e9beccd3040905d9a848a5bfdbe06",
+      "contract": "1.0.0",
+      "min_drsg": "2.7.0"
     }
   ]
 }
