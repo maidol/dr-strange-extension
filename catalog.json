@@ -22,10 +22,10 @@
     },
     {
       "name": "ts",
-      "version": "1.4.0",
+      "version": "2.0.0",
       "claims": ".ts .tsx .mts .cts .js .jsx .mjs .cjs",
-      "url": "https://github.com/wangyingsm/dr-strange-extension/releases/download/ts-v1.4.0/ts.wasm",
-      "sha256": "ba8696d690c30393f3954ccc3d8f255790ad670b0114e014869d13645700efce",
+      "url": "https://github.com/wangyingsm/dr-strange-extension/releases/download/ts-v2.0.0/ts.wasm",
+      "sha256": "d99f6db48958e831d4a35c205a3276c1fa4bde4e5b355688c95a257d6883a4a8",
       "contract": "1.0.0",
       "min_drsg": "2.0.0"
     },
