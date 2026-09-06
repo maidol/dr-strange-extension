@@ -29,12 +29,18 @@ com.acme.core.Engine.Builder          a nested type chains through the outer
 
 ## Nodes
 
-| Label | Emitted for | Props beyond `doc_comment` (javadoc) / `visibility` / `file` / `line` |
+| Label | Emitted for | Props beyond `doc_comment` (javadoc) / `visibility` / `file` / `line` / `end_line` |
 |---|---|---|
 | `Package` | one per `package` declaration | `name`; javadoc from `package-info.java`. Packages nest by `CONTAINS` where both ends were parsed |
 | `Class` / `Interface` / `Enum` / `Record` / `Annotation` | type declarations | `fields`: described `name: type` list (a record's come from its header); `variants` for enum constants |
 | `Method` | methods and constructors — overloads share the key: one node, the first (with the docs) wins | `signature` (`void connect(int timeout)`) |
 | stand-ins | foreign types/members | `Class` / `Interface` / `Annotation` / `Function` (what the reference proves) + `External` |
+
+Every declaration also carries `end_line`: where it stops, so `snippet` reads
+exactly the declaration instead of a fixed number of lines after its first,
+and a reader sees whether a thing is six lines or two hundred without opening
+it. `line` still points at the **name**, so documentation above a declaration
+cannot move where the graph says it starts.
 
 ## Edges
 

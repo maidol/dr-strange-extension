@@ -28,7 +28,7 @@ example.com/demo/sub.Counter.Add      方法——path.Type.Method
 
 ## 节点
 
-| 标签 | 产生于 | `doc_comment` / `visibility` / `file` / `line` 之外的属性 |
+| 标签 | 产生于 | `doc_comment` / `visibility` / `file` / `line` / `end_line` 之外的属性 |
 |---|---|---|
 | `Package` | 每个包一个 | `name`、`imports`（包内各文件的并集，已排序）；`doc.go` 的文档并入。**无 file/line**——包横跨多个文件，任选其一都是武断 |
 | `Function` / `Method` | 声明（`Method` 挂在接收者类型下） | `signature`（含接收者，照原样） |
@@ -41,6 +41,10 @@ example.com/demo/sub.Counter.Add      方法——path.Type.Method
 `visibility: "exported"` 遵循 Go 的规则：首字母大写。`init` 特意缺席——
 一个包里的所有 `init` 共享一个名字，作为节点只能是键冲突，而其调用属于
 接线，不是 API。
+
+每个声明还带有 `end_line`：它在何处结束。于是 `snippet` 读取的正是这个声明本身，
+而不是从首行起固定的若干行；读者也无需打开文件就能看出一样东西是六行还是两百行。
+`line` 仍然指向**名字**所在处，因此声明上方的文档不会挪动图中记录的起始位置。
 
 ## 边
 

@@ -31,7 +31,7 @@ acme/src/api.Client.connect           类成员
 
 ## 节点
 
-| 标签 | 产生于 | `doc_comment`（JSDoc）/ `visibility` / `file` / `line` 之外的属性 |
+| 标签 | 产生于 | `doc_comment`（JSDoc）/ `visibility` / `file` / `line` / `end_line` 之外的属性 |
 |---|---|---|
 | `Module` | 每个文件 | `path`（照传入原样）、`imports`（specifier 照原样）；自身无 file/line |
 | `Function` | 函数声明**及 `const f = (…) =>` 箭头**——箭头初始化式*就是*函数，如此标注 | `signature`（源码切片，从不重新打印）、`is_async` |
@@ -45,6 +45,10 @@ acme/src/api.Client.connect           类成员
 导出的顶层声明带 `visibility: "exported"`。默认导出有名字时按名入键
 （`export default function boot` → `….boot`，可经 `default` 到达），否则
 为 `default`。
+
+每个声明还带有 `end_line`：它在何处结束。于是 `snippet` 读取的正是这个声明本身，
+而不是从首行起固定的若干行；读者也无需打开文件就能看出一样东西是六行还是两百行。
+`line` 仍然指向**名字**所在处，因此声明上方的文档不会挪动图中记录的起始位置。
 
 ## 边
 

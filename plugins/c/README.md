@@ -36,7 +36,7 @@ keep them apart; **binding** still follows C's linkage model (below).
 
 ## Nodes
 
-| Label | Emitted for | Props beyond `doc_comment` / `visibility` / `file` / `line` |
+| Label | Emitted for | Props beyond `doc_comment` / `visibility` / `file` / `line` / `end_line` |
 |---|---|---|
 | `File` | each `.c`/`.h` | `includes`: the include list **as resolved keys** — in-tree headers by path, `<system>` headers by name — so each entry is followable; unresolvable ones stay as written |
 | `Function` | definitions and (unmerged) prototypes | `signature` (return type + declarator, as written); `visibility: "static"` for file-local |
@@ -48,6 +48,12 @@ keep them apart; **binding** still follows C's linkage model (below).
 
 Documentation: `/** */`, `/* */`, and runs of `//` above a declaration all
 count — C documents in all three.
+
+Every declaration also carries `end_line`: where it stops, so `snippet` reads
+exactly the declaration instead of a fixed number of lines after its first,
+and a reader sees whether a thing is six lines or two hundred without opening
+it. `line` still points at the **name**, so documentation above a declaration
+cannot move where the graph says it starts.
 
 ## Edges
 

@@ -34,7 +34,7 @@ crate 名来自最近的 `Cargo.toml` 的 `[package] name`（`-` → `_`），�
 
 ## 节点
 
-| 标签 | 产生于 | `doc_comment` / `visibility` / `file` / `line` 之外的属性 |
+| 标签 | 产生于 | `doc_comment` / `visibility` / `file` / `line` / `end_line` 之外的属性 |
 |---|---|---|
 | `Module` | 每个文件与每个内联 `mod` | `path`（相对 crate 根：`src/compute/cache.rs`）、`imports`（解析后的 use 目标，连接为串） |
 | `Function` / `Method` | 自由函数、impl 函数（带 `self` 才是 `Method`） | `signature`、`returns`、`receiver`、`local_bindings`、`is_async`（仅为真时出现） |
@@ -48,6 +48,10 @@ crate 名来自最近的 `Cargo.toml` 的 `[package] name`（`-` → `_`），�
 配置 `include_source = "true"`（来自 `[plugins.rust]`）时，每个条目附带
 `_code`：照原样的源码，described 为仅供检索——`_` 前缀使其不进入 embedding
 与模式摘要。
+
+每个声明还带有 `end_line`：它在何处结束。于是 `snippet` 读取的正是这个声明本身，
+而不是从首行起固定的若干行；读者也无需打开文件就能看出一样东西是六行还是两百行。
+`line` 仍然指向**名字**所在处，因此声明上方的文档不会挪动图中记录的起始位置。
 
 ## 边
 

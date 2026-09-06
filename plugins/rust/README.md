@@ -38,7 +38,7 @@ still keys as `foo::…`, and two crates' `api::Thing` never merge.
 
 ## Nodes
 
-| Label | Emitted for | Props beyond `doc_comment` / `visibility` / `file` / `line` |
+| Label | Emitted for | Props beyond `doc_comment` / `visibility` / `file` / `line` / `end_line` |
 |---|---|---|
 | `Module` | each file and each inline `mod` | `path` (crate-root-relative: `src/compute/cache.rs`), `imports` (resolved use-targets, joined) |
 | `Function` / `Method` | free fns, impl fns (`Method` iff it takes `self`) | `signature`, `returns`, `receiver`, `local_bindings`, `is_async` (present only when true) |
@@ -52,6 +52,12 @@ still keys as `foo::…`, and two crates' `api::Thing` never merge.
 With `include_source = "true"` (from `[plugins.rust]`), each item also
 carries `_code`: the source as written, described as retrieval-only — the
 `_` prefix keeps it out of embeddings and the schema summary.
+
+Every declaration also carries `end_line`: where it stops, so `snippet` reads
+exactly the declaration instead of a fixed number of lines after its first,
+and a reader sees whether a thing is six lines or two hundred without opening
+it. `line` still points at the **name**, so documentation above a declaration
+cannot move where the graph says it starts.
 
 ## Edges
 

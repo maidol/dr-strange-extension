@@ -868,12 +868,14 @@ impl Walker<'_> {
             self.add_source(&mut props, f.range());
         }
         let line = self.line(f.name.range());
+        let end = self.end_line(f.range());
         // Overload stubs (`@overload`, `if TYPE_CHECKING` twins) share the
         // name; the first carries the docs and wins, silently.
         if self.facts.nodes.iter().any(|n| n.key == key) {
             return;
         }
         props.insert("line".into(), Value::from(line));
+        props.insert("end_line".into(), Value::from(end));
         self.facts.nodes.push(Node {
             key: key.clone(),
             label: label.into(),
@@ -1069,6 +1071,7 @@ impl Walker<'_> {
         }
         let line = self.line(c.name.range());
         props.insert("line".into(), Value::from(line));
+        props.insert("end_line".into(), Value::from(self.end_line(c.range())));
         self.facts.nodes.push(Node {
             key: key.clone(),
             label: "Class".into(),
@@ -1170,6 +1173,11 @@ impl Walker<'_> {
         }
         let line = self.line(name_range);
         props.insert("line".into(), Value::from(line));
+        // A bare name has no extent worth the word; an annotated or assigned
+        // one ends where its value does.
+        if let Some(end) = value.or(ann) {
+            props.insert("end_line".into(), Value::from(self.end_line(end)));
+        }
         self.facts.nodes.push(Node {
             key: key.clone(),
             label: label.into(),
@@ -1196,6 +1204,7 @@ impl Walker<'_> {
         );
         let line = self.line(n.range());
         props.insert("line".into(), Value::from(line));
+        props.insert("end_line".into(), Value::from(self.end_line(t.range())));
         self.facts.nodes.push(Node {
             key: key.clone(),
             label: "TypeAlias".into(),
@@ -1273,6 +1282,14 @@ impl Walker<'_> {
     /// 1-based, like every editor's gutter.
     fn line(&self, range: TextRange) -> u64 {
         self.lines.line_index(range.start()).get() as u64
+    }
+
+    /// Where a declaration stops. With [`Walker::line`] it says how big a
+    /// thing is without opening it, and lets `snippet` read exactly the
+    /// declaration instead of guessing a fixed number of lines after its
+    /// first.
+    fn end_line(&self, range: TextRange) -> u64 {
+        self.lines.line_index(range.end()).get() as u64
     }
 }
 

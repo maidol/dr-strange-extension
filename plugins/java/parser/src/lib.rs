@@ -427,6 +427,7 @@ impl Walker<'_> {
             props.insert("visibility".into(), Value::String(vis));
         }
         props.insert("line".into(), Value::from(line));
+        props.insert("end_line".into(), Value::from(self.end_line(node)));
         if self.include_source {
             self.add_source(&mut props, node);
         }
@@ -659,6 +660,7 @@ impl Walker<'_> {
             props.insert("visibility".into(), Value::String(vis));
         }
         props.insert("line".into(), Value::from(line));
+        props.insert("end_line".into(), Value::from(self.end_line(node)));
         if self.include_source {
             self.add_source(&mut props, node);
         }
@@ -1054,6 +1056,14 @@ impl Walker<'_> {
     /// 1-based, like every editor's gutter.
     fn line(&self, node: TsNode) -> u64 {
         node.start_position().row as u64 + 1
+    }
+
+    /// Where a declaration stops. With [`Walker::line`] it says how big a
+    /// thing is without opening it, and lets `snippet` read exactly the
+    /// declaration instead of guessing a fixed number of lines after its
+    /// first.
+    fn end_line(&self, node: TsNode) -> u64 {
+        node.end_position().row as u64 + 1
     }
 }
 

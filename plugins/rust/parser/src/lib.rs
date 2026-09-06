@@ -579,6 +579,7 @@ fn walk_items(items: &[syn::Item], parent: &str, include_source: bool, f: &mut F
             }
             syn::Item::Struct(s) => {
                 simple(f, parent, &s.ident, "Struct", &s.attrs, &s.vis);
+                set_end(f, s);
                 set_fields(f, s.fields.iter());
                 set_non_exhaustive(f, &s.attrs);
                 // Plain-path field types, machine-readable: what types
@@ -599,6 +600,7 @@ fn walk_items(items: &[syn::Item], parent: &str, include_source: bool, f: &mut F
             }
             syn::Item::Enum(e) => {
                 simple(f, parent, &e.ident, "Enum", &e.attrs, &e.vis);
+                set_end(f, e);
                 // The variants *are* the enum: a node saying only `Expr` says
                 // almost nothing, while its variants are the whole shape of it.
                 // A list rather than a joined string, so `CONTAINS` asks about
@@ -643,6 +645,7 @@ fn walk_items(items: &[syn::Item], parent: &str, include_source: bool, f: &mut F
             }
             syn::Item::Union(u) => {
                 simple(f, parent, &u.ident, "Union", &u.attrs, &u.vis);
+                set_end(f, u);
                 // A union is a struct whose fields overlap in memory; the
                 // fields are just as much its shape.
                 set_fields(f, u.fields.named.iter());
@@ -663,6 +666,7 @@ fn walk_items(items: &[syn::Item], parent: &str, include_source: bool, f: &mut F
                     ty_of(&c.ty),
                     line_of(&c.ident),
                 );
+                set_end(f, c);
                 set_value(f, &c.expr);
             }
             syn::Item::Static(s) => {
@@ -680,6 +684,7 @@ fn walk_items(items: &[syn::Item], parent: &str, include_source: bool, f: &mut F
                     ty_of(&s.ty),
                     line_of(&s.ident),
                 );
+                set_end(f, s);
                 set_value(f, &s.expr);
             }
             syn::Item::Type(t) => {
@@ -698,6 +703,7 @@ fn walk_items(items: &[syn::Item], parent: &str, include_source: bool, f: &mut F
                     ty_of(&t.ty),
                     line_of(&t.ident),
                 );
+                set_end(f, t);
             }
             syn::Item::Macro(m) => match &m.ident {
                 // `macro_rules! name` — a definition, so it is an item.
@@ -708,6 +714,7 @@ fn walk_items(items: &[syn::Item], parent: &str, include_source: bool, f: &mut F
                         add_source(&mut p, item);
                     }
                     p.insert("line".into(), Value::from(line_of(ident)));
+                    p.insert("end_line".into(), Value::from(end_line_of(m)));
                     f.nodes.push(Node {
                         key: key.clone(),
                         label: "Macro".into(),
@@ -758,6 +765,7 @@ fn walk_items(items: &[syn::Item], parent: &str, include_source: bool, f: &mut F
                     String::new(),
                     line_of(&t.ident),
                 );
+                set_end(f, t);
                 for ti in &t.items {
                     if let syn::TraitItem::Fn(m) = ti {
                         let mkey = format!("{key}::{}", m.sig.ident);
@@ -809,6 +817,7 @@ fn walk_items(items: &[syn::Item], parent: &str, include_source: bool, f: &mut F
                                 ("imports", join_imports(&imports)),
                             ]);
                             p.insert("line".into(), Value::from(line_of(&m.ident)));
+                            p.insert("end_line".into(), Value::from(end_line_of(m)));
                             p
                         },
                     });
@@ -5255,6 +5264,26 @@ fn line_of<T: syn::spanned::Spanned>(t: &T) -> u64 {
     t.span().start().line as u64
 }
 
+/// Where a declaration stops — the *whole item's* span, unlike [`line_of`],
+/// which deliberately takes the ident so documentation above a declaration
+/// cannot move where the graph says it starts.
+///
+/// The pair is "where the name is" to "where the item ends", which is what a
+/// reader wants and what lets `snippet` read a symbol instead of guessing a
+/// fixed number of lines after its first.
+fn end_line_of<T: syn::spanned::Spanned>(t: &T) -> u64 {
+    t.span().end().line as u64
+}
+
+/// Record where the item just emitted stops. Attached to the node the caller
+/// has only just pushed, the way `set_fields` and `set_non_exhaustive` are.
+fn set_end<T: syn::spanned::Spanned>(f: &mut FileFacts, item: &T) {
+    let end = end_line_of(item);
+    if let Some(n) = f.nodes.last_mut() {
+        n.props.insert("end_line".into(), Value::from(end));
+    }
+}
+
 /// An edge carrying the line the relation is written on.
 /// Stamp a call edge with how it was resolved — the metadata both surveyed
 /// competitors carry and this parser did not: the strategy that won, a
@@ -5385,6 +5414,13 @@ fn fn_facts(
         ("local_bindings", body.map(bindings_of).unwrap_or_default()),
     ]);
     props.insert("line".into(), Value::from(line_of(&sig.ident)));
+    props.insert(
+        "end_line".into(),
+        Value::from(match body {
+            Some(block) => end_line_of(block),
+            None => end_line_of(sig),
+        }),
+    );
     if sig.asyncness.is_some() {
         props.insert("is_async".into(), Value::Bool(true));
     }

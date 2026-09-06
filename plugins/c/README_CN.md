@@ -34,7 +34,7 @@ stdio.h                               <system> 头：外部 File
 
 ## 节点
 
-| 标签 | 产生于 | `doc_comment` / `visibility` / `file` / `line` 之外的属性 |
+| 标签 | 产生于 | `doc_comment` / `visibility` / `file` / `line` / `end_line` 之外的属性 |
 |---|---|---|
 | `File` | 每个 `.c`/`.h` | `includes`：include 清单**以解析后的键呈现**——树内头按路径、`<system>` 头按名——每一项都可追随；无法解析的照原样保留 |
 | `Function` | 定义与（未合并的）原型 | `signature`（返回类型 + 声明子，照原样）；文件局部的带 `visibility: "static"` |
@@ -45,6 +45,10 @@ stdio.h                               <system> 头：外部 File
 | 替身 | 按名识别的 libc（`memcpy` 对读者有实义）、`<system>` 头 | `Function` / `File` + `External` |
 
 文档：声明上方的 `/** */`、`/* */` 与连续 `//` 都算——C 用三种方式写文档。
+
+每个声明还带有 `end_line`：它在何处结束。于是 `snippet` 读取的正是这个声明本身，
+而不是从首行起固定的若干行；读者也无需打开文件就能看出一样东西是六行还是两百行。
+`line` 仍然指向**名字**所在处，因此声明上方的文档不会挪动图中记录的起始位置。
 
 ## 边
 

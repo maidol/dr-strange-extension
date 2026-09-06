@@ -3157,3 +3157,53 @@ fn attributes_become_annotated_by_with_their_whole_text() {
     );
     assert!(ann("k::quiet").is_empty(), "{:?}", ann("k::quiet"));
 }
+
+/// A declaration's extent, and the trap beside it: `line` points at the
+/// *name* so documentation and attributes above it cannot move where the
+/// graph says a thing starts, while the end comes from the whole item. Get
+/// that backwards and every recorded `file:line` a reader follows shifts up
+/// onto a doc comment.
+#[test]
+fn a_declaration_records_where_it_ends_without_moving_where_it_starts() {
+    let t = Tree::new("extent");
+    t.write("Cargo.toml", "[package]\nname = \"k\"\n");
+    t.write(
+        "src/lib.rs",
+        concat!(
+            "/// One.\n",               // 1
+            "/// Two.\n",               // 2
+            "#[derive(Clone)]\n",       // 3
+            "pub struct Cfg {\n",       // 4
+            "    pub n: u32,\n",        // 5
+            "}\n",                      // 6
+            "\n",                       // 7
+            "/// Documented.\n",        // 8
+            "#[inline]\n",              // 9
+            "pub fn work() -> u32 {\n", // 10
+            "    let x = 1;\n",         // 11
+            "    x\n",                  // 12
+            "}\n",                      // 13
+            "\n",                       // 14
+            "pub fn tiny() {}\n",       // 15
+        ),
+    );
+    let a = run(&t);
+    let at = |key: &str, prop: &str| -> Option<i64> {
+        a.nodes
+            .iter()
+            .find(|n| n.key == key)?
+            .props
+            .get(prop)?
+            .as_i64()
+    };
+
+    // The name's line, not the doc comment's and not the attribute's.
+    assert_eq!(at("k::Cfg", "line"), Some(4));
+    assert_eq!(at("k::Cfg", "end_line"), Some(6));
+    assert_eq!(at("k::work", "line"), Some(10));
+    assert_eq!(at("k::work", "end_line"), Some(13));
+    // A one-line function is one line, which is the whole point: `snippet`
+    // used to answer this with forty.
+    assert_eq!(at("k::tiny", "line"), Some(15));
+    assert_eq!(at("k::tiny", "end_line"), Some(15));
+}

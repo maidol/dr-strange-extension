@@ -30,7 +30,7 @@ deploy.main                           游离脚本就是它的文件名主干
 
 ## 节点
 
-| 标签 | 产生于 | `doc_comment`（docstring）/ `visibility` / `file` / `line` 之外的属性 |
+| 标签 | 产生于 | `doc_comment`（docstring）/ `visibility` / `file` / `line` / `end_line` 之外的属性 |
 |---|---|---|
 | `Module` | 每个文件 | `path`、`imports`；包的 docstring 落在其 `__init__` 模块节点上 |
 | `Function` / `Method` | `def` / 类体内的 `def` | `signature` 照原样（`def fetch(url: str, timeout: float = 5.0) -> bytes`）、`is_async` |
@@ -41,6 +41,10 @@ deploy.main                           游离脚本就是它的文件名主干
 
 `visibility: "exported"` 遵循 Python 的星号导入规则：模块声明了 `__all__`
 则以之为准，否则取所有不以下划线开头的名字。
+
+每个声明还带有 `end_line`：它在何处结束。于是 `snippet` 读取的正是这个声明本身，
+而不是从首行起固定的若干行；读者也无需打开文件就能看出一样东西是六行还是两百行。
+`line` 仍然指向**名字**所在处，因此声明上方的文档不会挪动图中记录的起始位置。
 
 ## 边
 

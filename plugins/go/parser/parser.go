@@ -477,6 +477,7 @@ func (w *walker) funcDecl(d *ast.FuncDecl) {
 	if w.includeSource {
 		w.addSource(props, d)
 	}
+	props["end_line"] = w.endLine(d)
 	w.node(parent, key, label, props, w.line(d))
 	w.calls(key, d.Body)
 	w.chans(key, d.Body)
@@ -605,6 +606,7 @@ func (w *walker) typeSpec(d *ast.GenDecl, s *ast.TypeSpec) {
 		if w.includeSource {
 			w.addSource(props, s)
 		}
+		props["end_line"] = w.endLine(s)
 		w.node(w.pkg, key, "Struct", props, w.line(s))
 	case *ast.InterfaceType:
 		iface := Iface{Key: key, Pkg: w.pkg}
@@ -612,6 +614,7 @@ func (w *walker) typeSpec(d *ast.GenDecl, s *ast.TypeSpec) {
 		if w.includeSource {
 			w.addSource(props, s)
 		}
+		props["end_line"] = w.endLine(s)
 		w.node(w.pkg, key, "Interface", props, w.line(s))
 		for _, m := range t.Methods.List {
 			if len(m.Names) == 0 {
@@ -633,7 +636,11 @@ func (w *walker) typeSpec(d *ast.GenDecl, s *ast.TypeSpec) {
 				// parser treats a trait's items. No visibility: an
 				// interface's methods are as public as the interface.
 				mkey := key + "." + id.Name
-				mprops := Props{"signature": "func " + id.Name + sig, "line": w.line(m)}
+				mprops := Props{
+					"signature": "func " + id.Name + sig,
+					"line":      w.line(m),
+					"end_line":  w.endLine(m),
+				}
 				if text := strings.TrimSpace(m.Doc.Text()); text != "" {
 					mprops["doc_comment"] = text
 				}
@@ -651,6 +658,7 @@ func (w *walker) typeSpec(d *ast.GenDecl, s *ast.TypeSpec) {
 		if w.includeSource {
 			w.addSource(props, s)
 		}
+		props["end_line"] = w.endLine(s)
 		w.node(w.pkg, key, label, props, w.line(s))
 	}
 }
@@ -716,6 +724,7 @@ func (w *walker) valueSpec(d *ast.GenDecl, s *ast.ValueSpec, values []ast.Expr, 
 			// initializer as written is the fact for each of them.
 			w.setValue(props, values[0])
 		}
+		props["end_line"] = w.endLine(id)
 		w.node(w.pkg, w.pkg+"."+id.Name, label, props, w.line(id))
 	}
 }
@@ -1086,6 +1095,14 @@ func (w *walker) node(parent, key, label string, props Props, line int) {
 // line is 1-based, like every editor's gutter.
 func (w *walker) line(n ast.Node) int {
 	return w.fset.Position(n.Pos()).Line
+}
+
+// endLine is where a declaration stops. Together with line it lets a reader
+// see how big a thing is without opening it, and lets `snippet` read exactly
+// the declaration instead of guessing a fixed number of lines after its
+// first.
+func (w *walker) endLine(n ast.Node) int {
+	return w.fset.Position(n.End()).Line
 }
 
 // props builds the common property set, dropping entries that came back

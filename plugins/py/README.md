@@ -31,7 +31,7 @@ deploy.main                           a loose script is just its stem
 
 ## Nodes
 
-| Label | Emitted for | Props beyond `doc_comment` (docstring) / `visibility` / `file` / `line` |
+| Label | Emitted for | Props beyond `doc_comment` (docstring) / `visibility` / `file` / `line` / `end_line` |
 |---|---|---|
 | `Module` | each file | `path`, `imports`; a package's docstring lands on its `__init__` module node |
 | `Function` / `Method` | `def` / class-body `def` | `signature` as written (`def fetch(url: str, timeout: float = 5.0) -> bytes`), `is_async` |
@@ -42,6 +42,12 @@ deploy.main                           a loose script is just its stem
 
 `visibility: "exported"` follows Python's star-import rule: `__all__` when
 the module declares one, else every name not underscore-prefixed.
+
+Every declaration also carries `end_line`: where it stops, so `snippet` reads
+exactly the declaration instead of a fixed number of lines after its first,
+and a reader sees whether a thing is six lines or two hundred without opening
+it. `line` still points at the **name**, so documentation above a declaration
+cannot move where the graph says it starts.
 
 ## Edges
 

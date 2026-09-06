@@ -396,6 +396,7 @@ impl Walker<'_> {
             props.insert("doc_comment".into(), Value::String(doc));
         }
         props.insert("line".into(), Value::from(line));
+        props.insert("end_line".into(), Value::from(self.end_line(node)));
         self.push_decl(key, label, props, line, true, false, name);
     }
 
@@ -426,6 +427,7 @@ impl Walker<'_> {
             props.insert("visibility".into(), Value::String("static".into()));
         }
         props.insert("line".into(), Value::from(line));
+        props.insert("end_line".into(), Value::from(self.end_line(node)));
         if self.include_source && is_definition {
             self.add_source(&mut props, node);
         }
@@ -536,6 +538,7 @@ impl Walker<'_> {
                 props.insert("visibility".into(), Value::String("static".into()));
             }
             props.insert("line".into(), Value::from(line));
+            props.insert("end_line".into(), Value::from(self.end_line(node)));
 
             let label = if is_function { "Function" } else { "Var" };
             // A prototype is a declaration; a global with an initializer —
@@ -588,6 +591,7 @@ impl Walker<'_> {
                 props.insert("doc_comment".into(), Value::String(doc));
             }
             props.insert("line".into(), Value::from(line));
+            props.insert("end_line".into(), Value::from(self.end_line(node)));
             let key = format!("{}::{name}", self.file_key);
             self.push_decl(key, "TypeAlias", props, line, true, false, name);
         }
@@ -640,6 +644,7 @@ impl Walker<'_> {
             props.insert("doc_comment".into(), Value::String(doc));
         }
         props.insert("line".into(), Value::from(line));
+        props.insert("end_line".into(), Value::from(self.end_line(node)));
 
         if label == "Enum" {
             let mut variants: Vec<String> = Vec::new();
@@ -999,6 +1004,14 @@ impl Walker<'_> {
     /// 1-based, like every editor's gutter.
     fn line(&self, node: TsNode) -> u64 {
         node.start_position().row as u64 + 1
+    }
+
+    /// Where a declaration stops. With [`Walker::line`] it says how big a
+    /// thing is without opening it, and lets `snippet` read exactly the
+    /// declaration instead of guessing a fixed number of lines after its
+    /// first.
+    fn end_line(&self, node: TsNode) -> u64 {
+        node.end_position().row as u64 + 1
     }
 }
 

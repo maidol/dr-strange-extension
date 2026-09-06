@@ -556,6 +556,7 @@ impl Walker<'_> {
                 let key = format!("{}.default", self.module);
                 let mut props = self.common_props(String::new(), e.span, "default");
                 props.insert("visibility".into(), Value::String("exported".into()));
+                props.insert("end_line".into(), Value::from(self.end_line(e.span)));
                 self.push_node(key.clone(), "Const", props, self.line(e.span));
                 self.facts.exports.push(Export {
                     name: "default".into(),
@@ -748,6 +749,8 @@ impl Walker<'_> {
                     let mut props = self.common_props(sig, expr.span(), &name);
                     props.insert("visibility".into(), Value::String("exported".into()));
                     let line = self.line(arrow.span);
+                    props.insert("end_line".into(), Value::from(self.end_line(arrow.span)));
+                    props.insert("end_line".into(), Value::from(self.end_line(a.span)));
                     self.push_contained(key.clone(), "Function", props, line);
                     self.local(&name, &key, true, true);
                     self.facts.exports.push(Export {
@@ -821,6 +824,7 @@ impl Walker<'_> {
                     props.insert("visibility".into(), Value::String("exported".into()));
                 }
                 let line = self.line(t.id.span);
+                props.insert("end_line".into(), Value::from(self.end_line(t.span)));
                 self.push_contained(key.clone(), "TypeAlias", props, line);
                 self.local(&name, &key, false, exported);
             }
@@ -1102,6 +1106,7 @@ impl Walker<'_> {
         if self.facts.nodes.iter().any(|n| n.key == key) {
             return;
         }
+        props.insert("end_line".into(), Value::from(self.end_line(f.span())));
         self.push_contained(key.clone(), "Function", props, line);
         self.local(name, &key, true, exported);
         if export_as == "default" && name != "default" {
@@ -1224,6 +1229,7 @@ impl Walker<'_> {
                 props.insert("visibility".into(), Value::String("exported".into()));
             }
             let line = self.line(ident.id.span);
+            props.insert("end_line".into(), Value::from(self.end_line(d.span)));
             self.push_contained(key.clone(), label, props, line);
             self.local(&name, &key, true, exported);
         }
@@ -1284,6 +1290,7 @@ impl Walker<'_> {
             self.add_source(&mut props, c.span);
         }
         let line = self.line(c.span);
+        props.insert("end_line".into(), Value::from(self.end_line(c.span)));
         self.push_contained(key.clone(), "Class", props, line);
         self.local(name, &key, true, exported);
         if export_as == "default" && name != "default" {
@@ -1337,6 +1344,7 @@ impl Walker<'_> {
                         self.add_source(&mut props, ctor.span);
                     }
                     let line = self.line(ctor.span);
+                    props.insert("end_line".into(), Value::from(self.end_line(ctor.span)));
                     self.push_node(mkey.clone(), "Method", props, line);
                     self.facts
                         .edges
@@ -1428,6 +1436,7 @@ impl Walker<'_> {
                         mprops.insert("doc_comment".into(), Value::String(doc));
                     }
                     let line = self.line(m.span);
+                    mprops.insert("end_line".into(), Value::from(self.end_line(m.span)));
                     self.push_node(mkey.clone(), "Method", mprops, line);
                     self.facts
                         .edges
@@ -1446,6 +1455,7 @@ impl Walker<'_> {
             );
         }
         let line = self.line(i.id.span);
+        props.insert("end_line".into(), Value::from(self.end_line(i.span)));
         // Insert before the method nodes so CONTAINS order reads naturally.
         self.push_contained(key.clone(), "Interface", props, line);
         self.local(&name, &key, false, exported);
@@ -1490,6 +1500,7 @@ impl Walker<'_> {
             );
         }
         let line = self.line(e.id.span);
+        props.insert("end_line".into(), Value::from(self.end_line(e.span)));
         self.push_contained(key.clone(), "Enum", props, line);
         self.local(&name, &key, true, exported);
     }
@@ -1615,6 +1626,14 @@ impl Walker<'_> {
     /// 1-based, like every editor's gutter.
     fn line(&self, span: Span) -> u64 {
         self.cm.lookup_char_pos(span.lo).line as u64
+    }
+
+    /// Where a declaration stops. With [`Walker::line`] it says how big a
+    /// thing is without opening it, and lets `snippet` read exactly the
+    /// declaration instead of guessing a fixed number of lines after its
+    /// first.
+    fn end_line(&self, span: Span) -> u64 {
+        self.cm.lookup_char_pos(span.hi).line as u64
     }
 
     fn clause_name(&self, e: &ast::Expr) -> Option<String> {

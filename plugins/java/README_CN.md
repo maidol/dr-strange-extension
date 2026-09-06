@@ -28,12 +28,16 @@ com.acme.core.Engine.Builder          嵌套类型经由外层串接
 
 ## 节点
 
-| 标签 | 产生于 | `doc_comment`（javadoc）/ `visibility` / `file` / `line` 之外的属性 |
+| 标签 | 产生于 | `doc_comment`（javadoc）/ `visibility` / `file` / `line` / `end_line` 之外的属性 |
 |---|---|---|
 | `Package` | 每个 `package` 声明一个 | `name`；`package-info.java` 的 javadoc。包在两端都被解析时经 `CONTAINS` 嵌套 |
 | `Class` / `Interface` / `Enum` / `Record` / `Annotation` | 类型声明 | `fields`：described 的 `name: type` 列表（record 的来自其头部）；枚举常量入 `variants` |
 | `Method` | 方法与构造函数——重载共享键：一个节点，先见者（带文档）胜 | `signature`（`void connect(int timeout)`） |
 | 替身 | 外部类型/成员 | `Class` / `Interface` / `Annotation` / `Function`（引用证明了什么）+ `External` |
+
+每个声明还带有 `end_line`：它在何处结束。于是 `snippet` 读取的正是这个声明本身，
+而不是从首行起固定的若干行；读者也无需打开文件就能看出一样东西是六行还是两百行。
+`line` 仍然指向**名字**所在处，因此声明上方的文档不会挪动图中记录的起始位置。
 
 ## 边
 

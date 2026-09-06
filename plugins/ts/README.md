@@ -33,7 +33,7 @@ manifest → the host's label.
 
 ## Nodes
 
-| Label | Emitted for | Props beyond `doc_comment` (JSDoc) / `visibility` / `file` / `line` |
+| Label | Emitted for | Props beyond `doc_comment` (JSDoc) / `visibility` / `file` / `line` / `end_line` |
 |---|---|---|
 | `Module` | each file | `path` (as handed), `imports` (specifiers as written); no file/line of its own |
 | `Function` | declarations **and `const f = (…) =>` arrows** — the arrow initializer *is* the function, labelled so | `signature` (source slice, never re-printed), `is_async` |
@@ -47,6 +47,12 @@ manifest → the host's label.
 `visibility: "exported"` for exported top-level declarations. A default
 export keys under its declared name when it has one (`export default
 function boot` → `….boot`, reachable as `default`), else `default`.
+
+Every declaration also carries `end_line`: where it stops, so `snippet` reads
+exactly the declaration instead of a fixed number of lines after its first,
+and a reader sees whether a thing is six lines or two hundred without opening
+it. `line` still points at the **name**, so documentation above a declaration
+cannot move where the graph says it starts.
 
 ## Edges
 

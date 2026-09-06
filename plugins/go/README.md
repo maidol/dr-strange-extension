@@ -31,7 +31,7 @@ host; with no manifest anywhere, the host's label names the tree.
 
 ## Nodes
 
-| Label | Emitted for | Props beyond `doc_comment` / `visibility` / `file` / `line` |
+| Label | Emitted for | Props beyond `doc_comment` / `visibility` / `file` / `line` / `end_line` |
 |---|---|---|
 | `Package` | one per package | `name`, `imports` (union across the package's files, sorted); doc from `doc.go` merges in. **No file/line** — a package spans files, and a single pick would be arbitrary |
 | `Function` / `Method` | declarations (`Method` hangs off its receiver type) | `signature` (receiver included, as written), `is_async` never (not a Go thing) |
@@ -44,6 +44,12 @@ host; with no manifest anywhere, the host's label names the tree.
 `visibility: "exported"` follows Go's rule: the capital letter. `init` is
 deliberately absent — every `init` in a package shares one name, so as a
 node it could only be a key collision, and its calls are wiring, not API.
+
+Every declaration also carries `end_line`: where it stops, so `snippet` reads
+exactly the declaration instead of a fixed number of lines after its first,
+and a reader sees whether a thing is six lines or two hundred without opening
+it. `line` still points at the **name**, so documentation above a declaration
+cannot move where the graph says it starts.
 
 ## Edges
 
