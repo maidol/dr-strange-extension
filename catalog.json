@@ -49,10 +49,10 @@
     },
     {
       "name": "c",
-      "version": "1.2.0",
+      "version": "2.0.0",
       "claims": ".c .h",
-      "url": "https://github.com/wangyingsm/dr-strange-extension/releases/download/c-v1.2.0/c.wasm",
-      "sha256": "92a17ae63eb4cea544cfa42dd3bc4957393e381644ac41523294d42cd1dd1663",
+      "url": "https://github.com/wangyingsm/dr-strange-extension/releases/download/c-v2.0.0/c.wasm",
+      "sha256": "e28bbe9eecc93eba468c80fa20ece3e86877e498c0fd4dd63ff0fcd72092fd84",
       "contract": "1.0.0",
       "min_drsg": "2.0.0"
     },
