@@ -927,3 +927,30 @@ fn annotated_types_become_uses_type_edges() {
         }
     }
 }
+
+/// `from asyncio import Queue` binds the type itself, so the annotation is
+/// written as one bare segment. Reading it through the imports must reach
+/// `asyncio.Queue` all the same — the middle segments a dotted path walks
+/// are simply none of them.
+#[test]
+fn a_bare_name_bound_by_a_from_import_types_its_receiver() {
+    let t = tree(vec![(
+        "app.py",
+        r#"
+from asyncio import Queue
+
+async def consume(q: Queue):
+    return await q.get()
+"#,
+    )]);
+    let a = run(&t);
+    assert!(
+        has_edge(&a, "app.consume", "CALLS", "asyncio.Queue.get"),
+        "{:?}",
+        a.edges
+            .iter()
+            .filter(|e| e.src == "app.consume")
+            .map(|e| e.dst.as_str())
+            .collect::<Vec<_>>()
+    );
+}

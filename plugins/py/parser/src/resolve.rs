@@ -381,7 +381,9 @@ pub fn assemble(all: Vec<FileFacts>) -> Assembled {
         if !member.is_empty() {
             module = format!("{module}.{member}");
         }
-        for part in &parts[1..parts.len().saturating_sub(1)] {
+        // The segments between root and name — none at all when the type is
+        // written bare, which is what a `from x import Name` binding leaves.
+        for part in parts.iter().skip(1).take(parts.len().saturating_sub(2)) {
             module = format!("{module}.{part}");
         }
         let root_module = module.split('.').next().unwrap_or(&module).to_owned();
