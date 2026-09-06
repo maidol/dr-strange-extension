@@ -57,13 +57,28 @@ every load.
 | `web` | `.html .htm .css` | tree-sitter html/css/js — one plugin, so `class="btn"` binds to the stylesheet that defines `.btn` | [latest](https://github.com/wangyingsm/dr-strange-extension/releases?q=web-v&expanded=true) |
 | `toml` | `.toml` | [toml](https://crates.io/crates/toml) — the smallest plugin that is still a plugin | [latest](https://github.com/wangyingsm/dr-strange-extension/releases?q=toml-v&expanded=true) |
 | `git` | *no extension* — a repository, by its `.git` | its own reader for git's object store, packs, refs and reflog; no `git` binary is run | [latest](https://github.com/wangyingsm/dr-strange-extension/releases?q=git-v&expanded=true) |
+| `deps` | *no extension* — a build manifest, by its **filename** | [serde_json](https://crates.io/crates/serde_json), [toml_edit](https://crates.io/crates/toml_edit) and [quick-xml](https://crates.io/crates/quick-xml), plus two line formats | [latest](https://github.com/wangyingsm/dr-strange-extension/releases?q=deps-v&expanded=true) |
 
-`git` is the one that claims no extension, because its input is not a file:
-digesting a directory that has a git directory in it also reads that
-repository's **history** — commits, branches, tags, merges, and the rebases
-only the reflog remembers — into a plane of its own, `<plane>_git`. Facts
-only, and no `git` binary: it reads the object store itself, from inside the
-sandbox, through the same `list`/`read` grant every other plugin has.
+Two of them claim no extension, because routing by file type is not how
+their input is found. The host reaches each by a **reserved name**: whatever
+is installed as `git` is handed a repository, and whatever is installed as
+`deps` is handed the manifest filenames the host knows. Neither is guessed at
+— with the plugin absent, the input is read exactly as it was before.
+
+`git`'s input is not a file at all: digesting a directory that has a git
+directory in it also reads that repository's **history** — commits, branches,
+tags, merges, and the rebases only the reflog remembers — into a plane of its
+own, `<plane>_git`. Facts only, and no `git` binary: it reads the object store
+itself, from inside the sandbox, through the same `list`/`read` grant every
+other plugin has.
+
+`deps` reads what a project **declares** it depends on — `package.json`,
+`go.mod`, `requirements.txt`, `pyproject.toml`, `pom.xml`, `build.gradle` —
+and keys each dependency the way the code plugins already key an import. The
+declared `express` and the imported `express` are then one node, carrying the
+version the manifest states. A manifest is a filename rather than an
+extension, which is why claiming `.json` would be wrong: it would take every
+fixture and `tsconfig` in the tree from the reader that handles them.
 
 Each *latest* link filters the [releases page](https://github.com/wangyingsm/dr-strange-extension/releases)
 to that plugin's tags, newest first; every release carries the `<plugin>.wasm`

@@ -27,6 +27,7 @@ on:
       - "c-v*"
       - "web-v*"
       - "toml-v*"
+      - "deps-v*"
       - "git-v*"
 
 permissions:
@@ -57,7 +58,8 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           plugin="${tag%%-v*}"
           case "$plugin" in
-            toml)  artifact="plugins/toml/target/wasm32-wasip2/release/drsg_plugin_toml.wasm" ;;
+            toml|deps)
+                   artifact="plugins/$plugin/target/wasm32-wasip2/release/drsg_plugin_$plugin.wasm" ;;
             go)    artifact="plugins/go/component/go.wasm" ;;
             rust|ts|py|c|java|web|git)
                    artifact="plugins/$plugin/component/target/wasm32-wasip2/release/drsg_plugin_$plugin.wasm" ;;

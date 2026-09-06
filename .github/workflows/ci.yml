@@ -66,6 +66,7 @@ jobs:
             plugins/web/parser
             plugins/git/parser
             plugins/toml
+            plugins/deps
       # Standalone crates, deliberately (each ships at its own pace), so the
       # gate loops rather than relying on a workspace.
       - name: Gates
@@ -73,7 +74,7 @@ jobs:
           for dir in sdk/rust \
                      plugins/rust/parser plugins/ts/parser plugins/py/parser \
                      plugins/java/parser plugins/c/parser plugins/web/parser \
-                     plugins/git/parser plugins/toml; do
+                     plugins/git/parser plugins/toml plugins/deps; do
             echo "::group::$dir"
             (cd "$dir" && cargo fmt --check && cargo clippy --all-targets && cargo test)
             echo "::endgroup::"
@@ -117,6 +118,7 @@ jobs:
             plugins/web/component
             plugins/git/component
             plugins/toml
+            plugins/deps
       - uses: actions/setup-go@v5
         with:
           go-version-file: plugins/go/parser/go.mod
@@ -140,7 +142,7 @@ jobs:
       - uses: extractions/setup-just@v3
       - name: Build every component
         run: |
-          for plugin in toml rust ts py c java web go git; do
+          for plugin in toml deps rust ts py c java web go git; do
             echo "::group::$plugin"
             just "${plugin}-plugin"
             echo "::endgroup::"
@@ -148,6 +150,7 @@ jobs:
       - name: Artifacts exist
         run: |
           ls -la plugins/toml/target/wasm32-wasip2/release/drsg_plugin_toml.wasm \
+                 plugins/deps/target/wasm32-wasip2/release/drsg_plugin_deps.wasm \
                  plugins/rust/component/target/wasm32-wasip2/release/drsg_plugin_rust.wasm \
                  plugins/ts/component/target/wasm32-wasip2/release/drsg_plugin_ts.wasm \
                  plugins/py/component/target/wasm32-wasip2/release/drsg_plugin_py.wasm \

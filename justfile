@@ -98,6 +98,11 @@ java-plugin:
 toml-plugin:
     cd plugins/toml && cargo build --release --target wasm32-wasip2
 
+# The manifest reader: pure Rust, no grammar and no C — what it reads is JSON,
+# TOML, XML and two line formats, and every reader for those is a crate.
+deps-plugin:
+    cd plugins/deps && cargo build --release --target wasm32-wasip2
+
 # The git plugin: pure Rust, no grammar and no C, because what it reads is a
 # binary format rather than a language.
 git-plugin:
@@ -114,6 +119,8 @@ test:
     cd plugins/c/parser && cargo test
     cd plugins/web/parser && cargo test
     cd plugins/git/parser && cargo test
+    cd plugins/toml && cargo test
+    cd plugins/deps && cargo test
 
 # The P0 eval board: every known resolution gap as an ignored test, red
 # until its phase lands. Failing here is the expected state — this recipe

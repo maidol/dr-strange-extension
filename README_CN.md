@@ -52,12 +52,24 @@
 | `web` | `.html .htm .css` | tree-sitter html/css/js —— 一个插件同时处理两种语言，`class="btn"` 才能绑定到定义 `.btn` 的样式表 | [最新版](https://github.com/wangyingsm/dr-strange-extension/releases?q=web-v&expanded=true) |
 | `toml` | `.toml` | [toml](https://crates.io/crates/toml) —— 最小的、但仍然完整的插件 | [最新版](https://github.com/wangyingsm/dr-strange-extension/releases?q=toml-v&expanded=true) |
 | `git` | *无扩展名* —— 以 `.git` 认出的仓库 | 自带的 git 对象库、pack、引用与 reflog 读取实现；不运行 `git` 可执行文件 | [最新版](https://github.com/wangyingsm/dr-strange-extension/releases?q=git-v&expanded=true) |
+| `deps` | *无扩展名* —— 以**文件名**认出的构建清单 | [serde_json](https://crates.io/crates/serde_json)、[toml_edit](https://crates.io/crates/toml_edit) 与 [quick-xml](https://crates.io/crates/quick-xml)，另加两种按行解析的格式 | [最新版](https://github.com/wangyingsm/dr-strange-extension/releases?q=deps-v&expanded=true) |
 
-`git` 是唯一不声明扩展名的插件，因为它的输入不是文件：digest 一个含有 git
-目录的目录时，会把该仓库的**历史**——提交、分支、标签、合并，以及只有
-reflog 还记得的变基——一并读进它自己的 plane，即 `<plane>_git`。只产出事实，
-且不运行 `git`：它在沙箱内、通过与其他插件相同的 `list`/`read` 授权，自己
-读对象库。
+其中两个不声明扩展名，因为按文件类型路由并不是找到它们输入的方式。宿主以
+**保留名**抵达各自：以 `git` 之名安装的插件会拿到仓库，以 `deps` 之名安装的
+插件会拿到宿主认识的清单文件名。二者皆不作猜测——插件缺席时，输入仍与从前
+一样被读取。
+
+`git` 的输入根本不是文件：digest 一个含有 git 目录的目录时，会把该仓库的
+**历史**——提交、分支、标签、合并，以及只有 reflog 还记得的变基——一并读进
+它自己的 plane，即 `<plane>_git`。只产出事实，且不运行 `git`：它在沙箱内、
+通过与其他插件相同的 `list`/`read` 授权，自己读对象库。
+
+`deps` 读的是一个项目**声明**它依赖什么——`package.json`、`go.mod`、
+`requirements.txt`、`pyproject.toml`、`pom.xml`、`build.gradle`——并按代码插件
+为 import 定键的方式为每个依赖定键。于是被声明的 `express` 与被 import 的
+`express` 成为同一个节点，并带上清单所述的版本。清单是文件名而非扩展名，这正是
+声明 `.json` 会出错的原因：那会把树中每个 fixture 和 `tsconfig` 都从本该处理
+它们的读取器那里夺走。
 
 每个「最新版」链接会将[发布页](https://github.com/wangyingsm/dr-strange-extension/releases)
 过滤到该插件的标签，最新的排在最前；每个发布都带有 `<plugin>.wasm` 与其
