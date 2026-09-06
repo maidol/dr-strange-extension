@@ -59,12 +59,13 @@ carries `_code`: the source as written, described as retrieval-only — the
 |---|---|---|
 | `CONTAINS` | module → item, type → variant | declaration site |
 | `HAS_METHOD` | trait/type → its methods | method's line |
-| `CALLS` | function → what it calls | **call site** |
-| `IMPLEMENTS` | type → trait (`impl` blocks); `From<i64>` rides the edge as an `impl` prop rather than minting a second `From` node | the `impl` keyword |
+| `CALLS` | function → what it calls. Carries `concurrent` when the site departs from waiting: `spawned` for work handed to another task or thread, `blocking` for `spawn_blocking`. One caller reaching one callee both ways folds to one edge carrying the union, so a site that awaits cannot swallow one that spawns by being written first | **call site** |
+| `IMPLEMENTS` | type → trait, from an `impl` block **or a `#[derive(...)]`** — the same fact either way, with `derived` on the edge to say which spelling the source used. `From<i64>` rides the edge as an `impl` prop rather than minting a second `From` node | the `impl` keyword, or the derive |
 | `IMPORTS` | module → what its `use` statements name (with `as_written` when aliased) | the `use` statement |
 | `INSTANTIATES` | function → a type it **builds**, with `variant` on the edge when it built one of an enum's. Construction is not a call: `Ok(v)`, `Mine::A(v)`, `Meters(1.0)` and `Widget { .. }` are all spelled like calls or literals and all name a *type*, so none of them mints a `Function` node for a constructor that is no item | construction site |
 | `INVOKES` | module → an item-position macro invocation, `arguments` described on the edge — a **marked blind spot**: nothing expands macros, so the items they define are absent, but where they are defined is findable | invocation site |
 | `REFERENCES` | function → a function it **passes as a value** rather than calls | the argument |
+| `ANNOTATED_BY` | item → an attribute on it — `#[tokio::main]`, `#[get("/health")]`, `#[serde(...)]`. The *path* is the node and the whole attribute rides on the edge as `arguments`, so `get` stays one node with a route per edge instead of a node per route. `derive` leaves by the other door; `doc`, `non_exhaustive`, the `#[test]` family, lint and codegen attributes and `cfg` stay out | the attribute |
 | `USES_TYPE` | declaration → a type it is **typed by**, `role` on the edge saying which position (`field`, `param`, `return`, `variant`, `alias`) and the union of them when one pair is written twice. Generic arguments are walked — `mpsc::Sender<Job>` is a dependency on `Job` — and only types this tree declares get an edge; a foreign one stays text in `signature`/`fields`. Never a self-loop | — |
 
 ## Resolution — the certainty line
@@ -161,6 +162,10 @@ the facts carry `serde_json::Value` properties — the partial format is the
 plugin's own business; the host never looks inside.
 
 ## Known limits
+
+`join!`/`select!` are macros, and syn hands the parser an opaque token
+stream, so the calls inside them are not seen at all — a concurrency blind
+spot that shares its cause with the one below.
 
 Macro-generated items are absent (marked by `INVOKES`); trait-method calls
 on generic receivers are method calls, hence counted; a chain through a std

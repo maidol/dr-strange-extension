@@ -177,6 +177,18 @@ pub struct FileFacts {
     closure_sigs: Vec<(String, usize, Vec<String>)>,
     /// `(trait key, supertrait base path as written, line)` — `trait E: D`.
     trait_bases: Vec<(String, String, u64)>,
+    /// `(type key, derived trait as written, line)` — `#[derive(Clone)]`.
+    /// Resolved exactly as a supertrait is, and emitted as IMPLEMENTS: a
+    /// derive and a hand-written `impl` state the same fact, and recording
+    /// one but not the other made the graph disagree with itself.
+    #[serde(default)]
+    derives: Vec<(String, String, u64)>,
+    /// `(owner key, attribute path as written, the whole attribute, line)` —
+    /// `#[tokio::main]`, `#[get("/health")]`. The path is what the node is;
+    /// the text rides on the edge, so `get` stays one node with a route per
+    /// edge rather than a node per route.
+    #[serde(default)]
+    annotations: Vec<(String, String, String, u64)>,
     /// `(caller key, local name, how its type is known)` — the bindings whose
     /// type a parser *can* know, kept for method-call resolution.
     local_hints: Vec<(String, String, LocalHint)>,
@@ -242,6 +254,14 @@ struct Call {
     /// `BTreeSet::insert` keeps the first, and visiting order is source
     /// order.
     line: u64,
+    /// How control departs from waiting for this callee, when it does:
+    /// `spawned` for work handed to another task or thread, `blocking` for
+    /// `spawn_blocking`. Not part of identity either, and unioned rather than
+    /// overwritten when one body reaches one callee both ways — a call
+    /// awaited on one line and spawned on another is both, and the spawned
+    /// half is the half worth seeing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    concurrent: Option<String>,
 }
 
 impl PartialEq for Call {
@@ -541,6 +561,7 @@ fn walk_items(items: &[syn::Item], parent: &str, include_source: bool, f: &mut F
                 f.scopes.insert(key.clone(), parent.to_string());
                 f.edges
                     .push(edge_at(parent, &key, "CONTAINS", line_of(&func.sig.ident)));
+                collect_attrs(f, &key, &func.attrs, line_of(&func.sig.ident));
                 collect_calls(&key, &func.block, f);
                 if let Some(ret) = ret_written(&func.sig) {
                     f.returns.push((key.clone(), ret));
@@ -753,6 +774,7 @@ fn walk_items(items: &[syn::Item], parent: &str, include_source: bool, f: &mut F
                         f.scopes.insert(mkey.clone(), parent.to_string());
                         f.edges
                             .push(edge_at(&key, &mkey, "HAS_METHOD", line_of(&m.sig.ident)));
+                        collect_attrs(f, &mkey, &m.attrs, line_of(&m.sig.ident));
                         if let Some(ret) = ret_written(&m.sig) {
                             f.returns.push((mkey.clone(), ret));
                         }
@@ -839,6 +861,7 @@ fn walk_impl(im: &syn::ItemImpl, parent: &str, include_source: bool, f: &mut Fil
                         closure_sigs: closure_sig(&m.sig),
                         ret: ret_written(&m.sig),
                         param_types: sig_params(&m.sig),
+                        annotations: annotations_of(&m.attrs),
                         locals: local_hints(&m.block, &m.sig, &generics),
                         line: line_of(&m.sig.ident),
                     }
@@ -899,6 +922,10 @@ struct ImplMethod {
     /// the return above.
     #[serde(default)]
     param_types: Vec<(String, String)>,
+    /// `(attribute path, the whole attribute as written)` — keyed to this
+    /// method at assemble, where its key exists.
+    #[serde(default)]
+    annotations: Vec<(String, String)>,
     /// The body's type-known locals, for its method calls.
     locals: Vec<(String, LocalHint)>,
 }
@@ -1199,47 +1226,105 @@ struct BodyFacts {
     closures: Vec<(ClosureCallee, usize, Vec<ClosureParam>)>,
 }
 
+/// The calls that run their argument somewhere else.
+///
+/// Matched on the last path segment, the rule the py parser's `schedules`
+/// already uses, so `tokio::spawn`, `task::spawn`, a bare imported `spawn`
+/// and `handle.spawn(...)` are one rule rather than four spellings to keep up
+/// with. What runs elsewhere is the closure or async block they are handed —
+/// the spawner itself is called synchronously, and marking the edge to
+/// something named `spawn` would only repeat its own name.
+fn spawner_shape(name: &str) -> Option<&'static str> {
+    match name {
+        "spawn" | "spawn_local" | "spawn_pinned" => Some("spawned"),
+        "spawn_blocking" => Some("blocking"),
+        _ => None,
+    }
+}
+
+/// The union of two departures — neither swallows the other, and a site that
+/// simply waits contributes nothing.
+fn union_concurrency(a: Option<String>, b: Option<String>) -> Option<String> {
+    let mut kinds: BTreeSet<String> = BTreeSet::new();
+    for k in [a, b].into_iter().flatten() {
+        kinds.extend(k.split(", ").map(str::to_string));
+    }
+    (!kinds.is_empty()).then(|| kinds.into_iter().collect::<Vec<_>>().join(", "))
+}
+
 fn call_names(block: &syn::Block) -> BodyFacts {
-    struct Calls<'a>(&'a mut BodyFacts);
+    struct Calls<'a> {
+        facts: &'a mut BodyFacts,
+        /// The spawners this visit is inside, innermost last. A
+        /// `rayon::scope(|s| s.spawn(...))` nests, and the inner one is what
+        /// the call actually runs under.
+        spawns: Vec<&'static str>,
+    }
+    impl Calls<'_> {
+        /// Record a call, carrying whatever it runs under, and fold it into
+        /// any earlier call to the same callee: first line wins, departures
+        /// union.
+        fn note(&mut self, mut call: Call) {
+            call.concurrent = self.spawns.last().map(|s| (*s).to_string());
+            if let Some(prev) = self.facts.calls.take(&call) {
+                call.line = prev.line;
+                call.concurrent = union_concurrency(prev.concurrent, call.concurrent);
+            }
+            self.facts.calls.insert(call);
+        }
+    }
     impl<'ast> Visit<'ast> for Calls<'_> {
         fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            let mut spawner = None;
             if let syn::Expr::Path(p) = &*node.func
                 && let Some(last) = p.path.segments.last()
             {
-                self.0.calls.insert(Call {
+                spawner = spawner_shape(&last.ident.to_string());
+                self.note(Call {
                     name: last.ident.to_string(),
                     path: Some(path_of(&p.path)),
                     recv: None,
                     line: line_of(node),
+                    concurrent: None,
                 });
             }
             for (i, arg) in node.args.iter().enumerate() {
                 if let Some(name) = bare_fn_arg(arg) {
-                    self.0.fn_refs.insert((name, line_of(node)));
+                    self.facts.fn_refs.insert((name, line_of(node)));
                 }
                 if let (Some(params), syn::Expr::Path(p)) = (closure_params(arg), &*node.func)
                     && p.qself.is_none()
                 {
-                    self.0
+                    self.facts
                         .closures
                         .push((ClosureCallee::Path(path_of(&p.path)), i, params));
                 }
             }
+            // Everything inside a spawner's arguments runs where the spawner
+            // put it, however deep the closure or async block goes.
+            if let Some(shape) = spawner {
+                self.spawns.push(shape);
+            }
             syn::visit::visit_expr_call(self, node);
+            if spawner.is_some() {
+                self.spawns.pop();
+            }
         }
         fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-            self.0.calls.insert(Call {
+            let spawner = spawner_shape(&node.method.to_string());
+            self.note(Call {
                 name: node.method.to_string(),
                 path: None,
                 recv: chain_of(&node.receiver),
                 line: line_of(node),
+                concurrent: None,
             });
             for (i, arg) in node.args.iter().enumerate() {
                 if let Some(name) = bare_fn_arg(arg) {
-                    self.0.fn_refs.insert((name, line_of(node)));
+                    self.facts.fn_refs.insert((name, line_of(node)));
                 }
                 if let Some(params) = closure_params(arg) {
-                    self.0.closures.push((
+                    self.facts.closures.push((
                         ClosureCallee::Method {
                             recv: chain_of(&node.receiver),
                             name: node.method.to_string(),
@@ -1253,17 +1338,29 @@ fn call_names(block: &syn::Block) -> BodyFacts {
                     ));
                 }
             }
+            if let Some(shape) = spawner {
+                self.spawns.push(shape);
+            }
             syn::visit::visit_expr_method_call(self, node);
+            if spawner.is_some() {
+                self.spawns.pop();
+            }
         }
         fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
             if node.qself.is_none() {
-                self.0.insts.insert((path_of(&node.path), line_of(node)));
+                self.facts
+                    .insts
+                    .insert((path_of(&node.path), line_of(node)));
             }
             syn::visit::visit_expr_struct(self, node);
         }
     }
     let mut out = BodyFacts::default();
-    Calls(&mut out).visit_block(block);
+    Calls {
+        facts: &mut out,
+        spawns: Vec::new(),
+    }
+    .visit_block(block);
     out
 }
 
@@ -1979,6 +2076,11 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
     let mut closure_sig_map: BTreeMap<(String, usize), Vec<String>> = BTreeMap::new();
     let mut pending_closures: Vec<(String, ClosureCallee, usize, Vec<ClosureParam>)> = Vec::new();
 
+    // `#[cfg]` alternatives can state one derive twice; one edge is the fact.
+    let mut derive_seen: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut derives_recorded = 0usize;
+    let mut annotations_recorded = 0usize;
+
     let aliases = build_aliases(&files, &declared);
 
     for f in &files {
@@ -2086,6 +2188,65 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
                 &mut external,
             );
             impl_edges.push(edge_at(trait_key, &target, "EXTENDS", *line));
+        }
+        // A derive is an impl the compiler writes. Recorded as the same edge
+        // a hand-written one makes — with `derived` on it, because which of
+        // the two spellings was used is a fact about the source, not a
+        // different relation — and resolved the same way, so an external
+        // trait lands on the stand-in a written `impl Clone for T` already
+        // lands on.
+        for (type_key, written, line) in &f.derives {
+            let target = resolve(
+                written,
+                &f.module,
+                &imports,
+                &traits,
+                &declared,
+                &scopes,
+                "Trait",
+                &mut external,
+            );
+            if !derive_seen.insert((type_key.clone(), target.clone())) {
+                continue; // two `#[cfg]` arms can state one derive twice
+            }
+            let mut e = edge_at(type_key, &target, "IMPLEMENTS", *line);
+            e.props.insert(
+                "derived".into(),
+                json!({
+                    "$desc": "the compiler wrote this impl from a `#[derive(...)]`, rather than the source spelling it out",
+                    "$value": Value::Bool(true),
+                }),
+            );
+            impl_edges.push(e);
+            derives_recorded += 1;
+        }
+        // What an attribute says about the item it sits on. On a service the
+        // attributes are the architecture — the same argument the java plugin
+        // makes for Spring — and the whole attribute rides on the edge so a
+        // reader gets the route, not just the word `get`.
+        for (owner, path, text, line) in &f.annotations {
+            let target = resolve(
+                path,
+                &f.module,
+                &imports,
+                &traits,
+                &declared,
+                &scopes,
+                "Macro",
+                &mut external,
+            );
+            let mut e = edge_at(owner, &target, "ANNOTATED_BY", *line);
+            if text != path {
+                e.props.insert(
+                    "arguments".into(),
+                    json!({
+                        "$desc": "the attribute as written, arguments included",
+                        "$value": Value::String(text.clone()),
+                    }),
+                );
+            }
+            impl_edges.push(e);
+            annotations_recorded += 1;
         }
 
         // Every `use` becomes an edge to what it names. An import that lands
@@ -2266,6 +2427,30 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
                         expand_written(written, &self_or),
                     ));
                 }
+                for (path, text) in &m.annotations {
+                    let target = resolve(
+                        path,
+                        &b.module,
+                        &imports,
+                        &traits,
+                        &declared,
+                        &scopes,
+                        "Macro",
+                        &mut external,
+                    );
+                    let mut e = edge_at(&mkey, &target, "ANNOTATED_BY", m.line);
+                    if text != path {
+                        e.props.insert(
+                            "arguments".into(),
+                            json!({
+                                "$desc": "the attribute as written, arguments included",
+                                "$value": Value::String(text.clone()),
+                            }),
+                        );
+                    }
+                    impl_edges.push(e);
+                    annotations_recorded += 1;
+                }
                 for (ident, hint) in &m.locals {
                     local_inits
                         .entry((mkey.clone(), ident.clone()))
@@ -2303,6 +2488,7 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
                             name: c.name.clone(),
                             recv: c.recv.as_deref().map(|r| expand_chain(r, &deself)),
                             line: c.line,
+                            concurrent: c.concurrent.clone(),
                         },
                     )
                 }));
@@ -2398,6 +2584,7 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
         let written = call.path.clone().unwrap_or_else(|| call.name.clone());
         let mut e = edge_at(caller, &key, "CALLS", call.line);
         stamp(&mut e, "unresolved", "none", &written);
+        mark_concurrent(&mut e, call);
         e.props.insert("_reason".into(), Value::String(reason));
         // The receiver as it was read, so the blind spot names its cause:
         // `v.iter()` untyped means `v` is, and the next fix knows where.
@@ -2406,6 +2593,23 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
         }
         edges.push(e);
     };
+
+    /// Say how control departs from waiting for this callee, when it does.
+    ///
+    /// The same property go and py put on a CALLS edge, in the same words: a
+    /// reader who cannot tell a spawned call from a synchronous one is
+    /// reading a different program.
+    fn mark_concurrent(e: &mut Edge, call: &Call) {
+        if let Some(shape) = &call.concurrent {
+            e.props.insert(
+                "concurrent".into(),
+                json!({
+                    "$desc": "how control departs from waiting for this callee: `spawned` runs it on another task or thread, `blocking` on the blocking pool",
+                    "$value": shape.clone(),
+                }),
+            );
+        }
+    }
 
     // Deterministic receiver typing (P3). `self.m()` is the impl's own type;
     // `x.m()` types x through its annotation or its initializer — a call
@@ -2718,6 +2922,7 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
             if emitted.insert((caller.clone(), target.to_string())) {
                 let mut e = edge_at(&caller, target, "CALLS", call.line);
                 stamp(&mut e, strategy, band, &written);
+                mark_concurrent(&mut e, &call);
                 out.edges.push(e);
             }
         };
@@ -2982,6 +3187,19 @@ pub fn assemble(parsed: Vec<FileFacts>) -> Assembled {
         out.notes.push(format!(
             "{ambiguous} call(s) matched more than one function by name and were \
              left out: resolving them needs import and generic resolution"
+        ));
+    }
+    if derives_recorded > 0 {
+        out.notes.push(format!(
+            "{derives_recorded} derived impl(s) recorded as `IMPLEMENTS` with `derived` on \
+             the edge — what `#[derive(...)]` states, which a hand-written `impl` has \
+             always recorded"
+        ));
+    }
+    if annotations_recorded > 0 {
+        out.notes.push(format!(
+            "{annotations_recorded} attribute(s) recorded as `ANNOTATED_BY`, the whole \
+             attribute on the edge; lint, codegen and `cfg` attributes are not among them"
         ));
     }
     if type_ref_edges > 0 || foreign_type_refs > 0 {
@@ -4626,6 +4844,77 @@ fn simple(
     );
 }
 
+/// Attributes that say nothing about structure, and stay out.
+///
+/// `derive` leaves by the other door (IMPLEMENTS); `doc` and `non_exhaustive`
+/// are already properties; the `#[test]` family is `test_flag`; the lint and
+/// codegen attributes are instructions to the compiler about this item, not
+/// facts about the program's shape. `cfg` is on everything and the parser's
+/// policy on it is stated elsewhere.
+const ATTR_NOISE: &[&str] = &[
+    "doc",
+    "derive",
+    "non_exhaustive",
+    "test",
+    "bench",
+    "rstest",
+    "allow",
+    "warn",
+    "deny",
+    "expect",
+    "forbid",
+    "inline",
+    "must_use",
+    "repr",
+    "cfg",
+    "cfg_attr",
+    "automatically_derived",
+];
+
+/// The traits a `#[derive(...)]` list names, as written.
+fn derived_traits(attrs: &[syn::Attribute]) -> Vec<String> {
+    let mut out = Vec::new();
+    for attr in attrs.iter().filter(|a| a.path().is_ident("derive")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            out.push(path_of(&meta.path));
+            // A derive helper takes no arguments here; consuming any that
+            // appear keeps the parse from failing the whole list.
+            Ok(())
+        });
+    }
+    out
+}
+
+/// The attributes worth recording, as `(path, the whole attribute as written)`.
+fn annotations_of(attrs: &[syn::Attribute]) -> Vec<(String, String)> {
+    attrs
+        .iter()
+        .filter(|a| {
+            let last = a.path().segments.last().map(|s| s.ident.to_string());
+            !last.is_some_and(|l| ATTR_NOISE.contains(&l.as_str()))
+        })
+        .map(|a| {
+            let path = path_of(a.path());
+            // As written, minus the `#[` `]`: what the source says is what a
+            // reader needs, and re-printing tokens is the only way to get it
+            // from syn.
+            let text = tidy(&a.meta.to_token_stream().to_string());
+            (path, text)
+        })
+        .collect()
+}
+
+/// Record what this item's attributes state: the traits a derive implements,
+/// and every other attribute as an annotation.
+fn collect_attrs(f: &mut FileFacts, key: &str, attrs: &[syn::Attribute], line: u64) {
+    for trait_written in derived_traits(attrs) {
+        f.derives.push((key.to_string(), trait_written, line));
+    }
+    for (path, text) in annotations_of(attrs) {
+        f.annotations.push((key.to_string(), path, text, line));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn node(
     f: &mut FileFacts,
@@ -4643,6 +4932,7 @@ fn node(
         ("visibility", visibility(vis)),
     ]);
     props.insert("line".into(), Value::from(line));
+    collect_attrs(f, &key, attrs, line);
     f.nodes.push(Node {
         key: key.clone(),
         label: label.into(),

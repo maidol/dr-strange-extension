@@ -55,12 +55,13 @@ crate 名来自最近的 `Cargo.toml` 的 `[package] name`（`-` → `_`），�
 |---|---|---|
 | `CONTAINS` | 模块 → 条目、类型 → 变体 | 声明处 |
 | `HAS_METHOD` | trait/类型 → 其方法 | 方法所在行 |
-| `CALLS` | 函数 → 它调用的对象 | **调用处** |
-| `IMPLEMENTS` | 类型 → trait（`impl` 块）；`From<i64>` 作为边上的 `impl` 属性存在，而非另铸一个 `From` 节点 | `impl` 关键字 |
+| `CALLS` | 函数 → 它调用的对象。当调用处不再等待时带上 `concurrent`：`spawned` 表示交给了另一个任务或线程，`blocking` 表示 `spawn_blocking`。同一调用方以两种方式到达同一被调方时折叠为一条边并取并集，因此先写的 await 不会吞掉后写的 spawn | **调用处** |
+| `IMPLEMENTS` | 类型 → trait，来自 `impl` 块**或 `#[derive(...)]`**——两者陈述的是同一个事实，边上的 `derived` 说明源码用的是哪一种写法。`From<i64>` 作为边上的 `impl` 属性存在，而非另铸一个 `From` 节点 | `impl` 关键字，或该 derive |
 | `IMPORTS` | 模块 → 其 `use` 语句命名的对象（有别名时带 `as_written`） | `use` 语句 |
 | `INSTANTIATES` | 函数 → 它**构造**的类型；构造的是枚举的变体时，`variant` 记在边上。构造不是调用：`Ok(v)`、`Mine::A(v)`、`Meters(1.0)`、`Widget { .. }` 都写得像调用或字面量，且都命名一个*类型*，因此不会为并非条目的构造器铸造 `Function` 节点 | 构造处 |
 | `INVOKES` | 模块 → 条目位置的宏调用，`arguments` described 在边上——一个**被标记的盲区**：没有任何东西展开宏，其定义的条目缺席，但定义发生之处可寻 | 调用处 |
 | `REFERENCES` | 函数 → 它**作为值传递**（而非调用）的函数 | 该实参 |
+| `ANNOTATED_BY` | 条目 → 其上的属性——`#[tokio::main]`、`#[get("/health")]`、`#[serde(...)]`。**路径**是节点，整条属性作为 `arguments` 记在边上，于是 `get` 始终是一个节点、每条路由一条边，而不是每条路由一个节点。`derive` 从另一扇门离开；`doc`、`non_exhaustive`、`#[test]` 一族、lint 与代码生成属性以及 `cfg` 都不在其中 | 该属性 |
 | `USES_TYPE` | 声明 → 为其**定型**的类型；`role` 记在边上，说明是哪个位置（`field`、`param`、`return`、`variant`、`alias`），同一对写了多次则取并集。泛型参数会被走入——`mpsc::Sender<Job>` 就是对 `Job` 的依赖——且只有本树声明的类型才成边，外来类型仍以文本留在 `signature`/`fields` 中。绝不自环 | — |
 
 ## 解析——确定性的界线
@@ -140,6 +141,8 @@ $ drsg plugin install …/drsg_plugin_rust.wasm
 的格式是插件自己的事，宿主从不查看。
 
 ## 已知局限
+
+`join!`/`select!` 是宏，syn 交给解析器的是不透明的 token 流，因此其中的调用完全不可见——这个并发盲区与下面那个同源。
 
 宏生成的条目缺席（由 `INVOKES` 标记）；泛型接收者上的 trait 方法调用属于
 方法调用，因而被计数；链式调用经过一个解析器没有其返回类型事实的 std 方法

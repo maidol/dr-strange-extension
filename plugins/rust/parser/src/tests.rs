@@ -2933,3 +2933,227 @@ pub fn round_trip(c: Cfg) -> Cfg {
         a.notes
     );
 }
+
+/// Concurrency is a fact about the call site. What a spawner is handed runs
+/// somewhere else, and a reader who cannot tell that call from a synchronous
+/// one is reading a different program. Only the departures are marked: inside
+/// an ordinary body, waiting is the expectation.
+#[test]
+fn a_call_that_runs_beside_its_caller_says_so() {
+    let t = Tree::new("spawned");
+    t.write("Cargo.toml", "[package]\nname = \"k\"\n");
+    t.write(
+        "src/lib.rs",
+        r#"
+pub struct Cfg;
+
+pub async fn work(c: &Cfg) -> u32 { let _ = c; 0 }
+pub fn blocking() {}
+pub fn plain() {}
+
+pub async fn run(handle: Handle) {
+    let c = Cfg;
+    tokio::spawn(async move { work(&c).await });
+    std::thread::spawn(|| blocking());
+    tokio::task::spawn_blocking(|| heavy());
+    handle.spawn(async { nested() });
+    plain();
+}
+
+pub fn heavy() {}
+pub fn nested() {}
+pub struct Handle;
+"#,
+    );
+    let a = run(&t);
+
+    let shape = |dst: &str| -> Option<String> {
+        a.edges
+            .iter()
+            .find(|e| e.ty == "CALLS" && e.src == "k::run" && e.dst.ends_with(dst))
+            .map(|e| match e.props.get("concurrent") {
+                Some(v) => text_of(v).unwrap_or_default(),
+                None => String::new(),
+            })
+    };
+
+    assert_eq!(shape("k::work").as_deref(), Some("spawned"));
+    assert_eq!(shape("k::blocking").as_deref(), Some("spawned"));
+    assert_eq!(
+        shape("k::heavy").as_deref(),
+        Some("blocking"),
+        "`spawn_blocking` is its own departure"
+    );
+    assert_eq!(
+        shape("k::nested").as_deref(),
+        Some("spawned"),
+        "a method-form spawner is the same rule"
+    );
+    assert_eq!(
+        shape("k::plain").as_deref(),
+        Some(""),
+        "an ordinary call says nothing — waiting is the expectation"
+    );
+    // The spawner itself is called synchronously; marking an edge to
+    // something named `spawn` would only repeat its own name.
+    let spawner = a
+        .edges
+        .iter()
+        .find(|e| e.ty == "CALLS" && e.dst.ends_with("tokio::spawn"))
+        .expect("the spawn call is still an edge");
+    assert!(!spawner.props.contains_key("concurrent"));
+}
+
+/// One caller reaching one callee both ways folds to one edge carrying the
+/// union: an awaited site must not swallow a spawned one by being written
+/// first, which is the rule ts and py already apply.
+#[test]
+fn a_spawned_site_survives_an_awaited_one() {
+    let t = Tree::new("union");
+    t.write("Cargo.toml", "[package]\nname = \"k\"\n");
+    t.write(
+        "src/lib.rs",
+        concat!(
+            "pub async fn work() {}\n",
+            "pub async fn first_awaited() {\n",
+            "    work().await;\n",
+            "    tokio::spawn(async { work().await });\n",
+            "}\n",
+            "pub async fn first_spawned() {\n",
+            "    tokio::spawn(async { work().await });\n",
+            "    work().await;\n",
+            "}\n",
+        ),
+    );
+    let a = run(&t);
+    for caller in ["k::first_awaited", "k::first_spawned"] {
+        let edges: Vec<_> = a
+            .edges
+            .iter()
+            .filter(|e| e.ty == "CALLS" && e.src == caller && e.dst == "k::work")
+            .collect();
+        assert_eq!(edges.len(), 1, "one callee, one edge: {edges:?}");
+        assert_eq!(
+            text_of(&edges[0].props["concurrent"]).as_deref(),
+            Some("spawned"),
+            "{caller}: the spawned half is what a reader needs, whichever was written first"
+        );
+    }
+}
+
+/// A derive and a hand-written impl state the same fact, and the graph used
+/// to record one and not the other. Which spelling was used rides on the
+/// edge, because that is a fact about the source, not a different relation.
+#[test]
+fn a_derive_is_an_implements_edge() {
+    let t = Tree::new("derives");
+    t.write("Cargo.toml", "[package]\nname = \"k\"\n");
+    t.write(
+        "src/lib.rs",
+        concat!(
+            "pub trait Local {}\n",
+            "#[derive(Clone, Debug, serde::Serialize)]\n",
+            "pub struct Cfg;\n",
+            "#[derive(Local)]\n",
+            "pub struct Both;\n",
+            "pub struct Written;\n",
+            "impl Local for Written {}\n",
+            "#[derive(Clone)]\n",
+            "pub enum Shape { A }\n",
+        ),
+    );
+    let a = run(&t);
+
+    let derived = |src: &str, dst: &str| -> Option<bool> {
+        a.edges
+            .iter()
+            .find(|e| e.ty == "IMPLEMENTS" && e.src == src && e.dst.ends_with(dst))
+            .map(|e| e.props.contains_key("derived"))
+    };
+
+    assert_eq!(derived("k::Cfg", "Clone"), Some(true));
+    assert_eq!(derived("k::Cfg", "Debug"), Some(true));
+    assert_eq!(
+        derived("k::Cfg", "serde::Serialize"),
+        Some(true),
+        "an external trait, exactly where a hand-written impl would land"
+    );
+    assert_eq!(derived("k::Shape", "Clone"), Some(true), "enums derive too");
+    assert_eq!(
+        derived("k::Both", "k::Local"),
+        Some(true),
+        "a derive naming a trait this tree declares resolves to it"
+    );
+    assert_eq!(
+        derived("k::Written", "k::Local"),
+        Some(false),
+        "a hand-written impl is the same edge, unmarked"
+    );
+}
+
+/// On a service the attributes are the architecture. The path is the node —
+/// so every GET handler is one hop from `get` — and the whole attribute rides
+/// on the edge, because the route is what a reader actually wants.
+#[test]
+fn attributes_become_annotated_by_with_their_whole_text() {
+    let t = Tree::new("attrs");
+    t.write("Cargo.toml", "[package]\nname = \"k\"\n");
+    t.write(
+        "src/lib.rs",
+        concat!(
+            "#[get(\"/health\")]\n",
+            "pub fn health() {}\n",
+            "#[get(\"/users\")]\n",
+            "pub fn users() {}\n",
+            "#[tokio::main]\n",
+            "pub async fn main() {}\n",
+            "#[derive(Clone)]\n",
+            "#[serde(rename_all = \"snake_case\")]\n",
+            "pub struct Cfg;\n",
+            "#[allow(dead_code)]\n",
+            "#[inline]\n",
+            "pub fn quiet() {}\n",
+        ),
+    );
+    let a = run(&t);
+
+    let ann = |src: &str| -> Vec<(String, String)> {
+        a.edges
+            .iter()
+            .filter(|e| e.ty == "ANNOTATED_BY" && e.src == src)
+            .map(|e| {
+                (
+                    e.dst.clone(),
+                    e.props
+                        .get("arguments")
+                        .and_then(text_of)
+                        .unwrap_or_default(),
+                )
+            })
+            .collect()
+    };
+
+    // Two routes, one `get` node — the vocabulary stays finite.
+    let health = ann("k::health");
+    assert_eq!(health.len(), 1, "{health:?}");
+    assert!(health[0].0.ends_with("get"), "{health:?}");
+    assert!(health[0].1.contains("/health"), "{health:?}");
+    assert!(ann("k::users")[0].1.contains("/users"));
+    assert_eq!(ann("k::users")[0].0, health[0].0, "one `get`, two edges");
+
+    assert!(ann("k::main")[0].0.ends_with("tokio::main"));
+    assert!(
+        ann("k::Cfg")
+            .iter()
+            .any(|(dst, args)| dst.ends_with("serde") && args.contains("snake_case")),
+        "{:?}",
+        ann("k::Cfg")
+    );
+    // A derive left by the other door, and the lint attributes are not facts
+    // about the program's shape.
+    assert!(
+        !ann("k::Cfg").iter().any(|(dst, _)| dst.ends_with("derive")),
+        "a derive is an IMPLEMENTS edge, not an annotation"
+    );
+    assert!(ann("k::quiet").is_empty(), "{:?}", ann("k::quiet"));
+}
