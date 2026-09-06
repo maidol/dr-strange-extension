@@ -41,10 +41,16 @@ impl Guest for RustPlugin {
     fn describe() -> Manifest {
         Manifest {
             name: "rust".into(),
-            // `2`: the parser's second shape — properties are the contract's
-            // JSON now, where `rust@1` wrote the database's native types. The
-            // facts are the same; `_generated_by` says which produced them.
-            version: "2".into(),
+            // `3`: this shape marks test code (`test_flag`, with a
+            // `_test_flag_confidence` the display skips), writes a declared
+            // type as a `USES_TYPE` edge rather than leaving it in a prop,
+            // records where each declaration ends, says which calls depart
+            // from waiting, and carries an attribute's whole written text on
+            // the `ANNOTATED_BY` edge. (`2` was where properties became the
+            // contract's JSON, which `rust@1` wrote as the database's native
+            // types.) Older facts stay readable; `_generated_by` says which
+            // version produced them.
+            version: "3".into(),
             extensions: vec!["rs".into()],
             logo: Some(LOGO.into()),
         }

@@ -2,7 +2,7 @@
 
 English · [简体中文](README_CN.md)
 
-Parses Go source into graph facts. Manifest `go@1`, claims `.go`. Built on
+Parses Go source into graph facts. Manifest `go@2`, claims `.go`. Built on
 **Go's own `go/parser` and `go/ast`** — the canonical frontend — compiled to
 a component with TinyGo. Written in Go on purpose: it proves the contract is
 language-neutral better than a second Rust plugin ever could.

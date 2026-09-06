@@ -2,7 +2,7 @@
 
 [English](README.md) · 简体中文
 
-将 Java 解析为图事实。Manifest 为 `java@1`，处理 `.java`。基于
+将 Java 解析为图事实。Manifest 为 `java@2`，处理 `.java`。基于
 [tree-sitter-java](https://github.com/tree-sitter/tree-sitter-java)——不存在
 成熟的纯 Rust Java 前端，而每个编辑器都已信任的语法比一个还需赢得信任的
 语法是更好的地基。C 运行时与语法经 wasi-sdk 的 clang 编译到

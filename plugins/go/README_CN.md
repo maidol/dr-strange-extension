@@ -2,7 +2,7 @@
 
 [English](README.md) · 简体中文
 
-将 Go 源码解析为图事实。Manifest 为 `go@1`，处理 `.go`。基于 **Go 自带的
+将 Go 源码解析为图事实。Manifest 为 `go@2`，处理 `.go`。基于 **Go 自带的
 `go/parser` 与 `go/ast`**——语言的正统前端——经 TinyGo 编译为组件。特意用
 Go 编写：它比第二个 Rust 插件更能证明契约是语言中立的。
 

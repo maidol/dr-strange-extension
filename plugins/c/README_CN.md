@@ -2,7 +2,7 @@
 
 [English](README.md) · 简体中文
 
-将 C 解析为图事实。Manifest 为 `c@1`，处理 `.c .h`——头文件也是 C，且其
+将 C 解析为图事实。Manifest 为 `c@2`，处理 `.c .h`——头文件也是 C，且其
 声明承载着文档。基于
 [tree-sitter-c](https://github.com/tree-sitter/tree-sitter-c)，与 Java 插件
 共用 wasi-sdk 工具链。预处理器**只记录，不展开**。

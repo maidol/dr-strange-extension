@@ -2,7 +2,7 @@
 
 [English](README.md) · 简体中文
 
-将 Python 解析为图事实。Manifest 为 `py@1`，处理 `.py .pyi .pyw`。基于
+将 Python 解析为图事实。Manifest 为 `py@2`，处理 `.py .pyi .pyw`。基于
 [ruff](https://github.com/astral-sh/ruff) 的 `ruff_python_parser`——ruff 与
 uv 背后的解析器，与语言同步（含 3.12 的 `type` 语句）——只做解析，不做
 推断。

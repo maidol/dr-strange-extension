@@ -2,7 +2,7 @@
 
 English · [简体中文](README_CN.md)
 
-Parses Java into graph facts. Manifest `java@1`, claims `.java`. Built on
+Parses Java into graph facts. Manifest `java@2`, claims `.java`. Built on
 [tree-sitter-java](https://github.com/tree-sitter/tree-sitter-java) — no
 mature pure-Rust Java frontend exists, and the grammar every editor already
 trusts is a better foundation than one we would have to earn trust for. The

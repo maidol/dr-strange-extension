@@ -15,8 +15,14 @@ type goPlugin struct{}
 
 func (goPlugin) Describe() ext.Manifest {
 	return ext.Manifest{
-		Name:       "go",
-		Version:    "1",
+		Name: "go",
+		// `2`: this shape marks test code (`test_flag`, with a
+		// `_test_flag_confidence` the display skips), writes a declared
+		// type as a `USES_TYPE` edge rather than leaving it in a prop, and
+		// records where each declaration ends. A plane holding `go@1` facts
+		// is still readable; it simply has none of these, and
+		// `_generated_by` says which version wrote what.
+		Version:    "2",
 		Extensions: []string{"go"},
 		// An original gopher-ish mark, not the trademarked mascot.
 		Logo: "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect x='3.5' y='4' width='17' height='16' rx='8' fill='#00add8'/><circle cx='8.8' cy='10.5' r='2.4' fill='#fff'/><circle cx='15.2' cy='10.5' r='2.4' fill='#fff'/><circle cx='9.6' cy='11' r='1.1'/><circle cx='14.4' cy='11' r='1.1'/><path d='M11 13.2h2v2.2h-2z' fill='#fff'/><ellipse cx='12' cy='13.2' rx='1.7' ry='1.1' fill='#e0c9a6'/></svg>",

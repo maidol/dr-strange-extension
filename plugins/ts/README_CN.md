@@ -2,7 +2,7 @@
 
 [English](README.md) · 简体中文
 
-将 TypeScript **与** JavaScript 解析为图事实。Manifest 为 `ts@1`，处理
+将 TypeScript **与** JavaScript 解析为图事实。Manifest 为 `ts@2`，处理
 `.ts .tsx .mts .cts .js .jsx .mjs .cjs`——一个解析器覆盖整个生态，混合仓库
 因此摄取为事实而不是一半沦为散文。基于 [swc](https://swc.rs) 的
 `swc_ecma_parser`（Next.js 背后的解析器），只做解析：不做变换、没有

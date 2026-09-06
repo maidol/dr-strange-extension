@@ -42,7 +42,13 @@ impl Guest for CPlugin {
     fn describe() -> Manifest {
         Manifest {
             name: "c".into(),
-            version: "1".into(),
+            // `2`: this shape marks test code (`test_flag`, with a
+            // `_test_flag_confidence` the display skips), writes a declared
+            // type as a `USES_TYPE` edge rather than leaving it in a prop,
+            // and records where each declaration ends. A plane holding
+            // `c@1` facts is still readable; it simply has none of
+            // these, and `_generated_by` says which version wrote what.
+            version: "2".into(),
             extensions: EXTENSIONS.iter().map(|e| e.to_string()).collect(),
             logo: Some(LOGO.into()),
         }

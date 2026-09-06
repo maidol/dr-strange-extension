@@ -2,7 +2,7 @@
 
 English · [简体中文](README_CN.md)
 
-Parses C into graph facts. Manifest `c@1`, claims `.c .h` — a header is C,
+Parses C into graph facts. Manifest `c@2`, claims `.c .h` — a header is C,
 and its declarations carry the documentation. Built on
 [tree-sitter-c](https://github.com/tree-sitter/tree-sitter-c) through the
 same wasi-sdk toolchain as the Java plugin. The preprocessor is **recorded,

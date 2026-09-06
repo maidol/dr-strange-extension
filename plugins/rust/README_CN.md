@@ -2,7 +2,7 @@
 
 [English](README.md) · 简体中文
 
-将 Rust 源码解析为图事实。Manifest 为 `rust@2`，处理 `.rs`。基于
+将 Rust 源码解析为图事实。Manifest 为 `rust@3`，处理 `.rs`。基于
 [syn](https://crates.io/crates/syn)——宏生态自身运行其上的解析器——只做
 解析：不做类型推断、不展开宏，而这正是重点。`@2` 是**事实格式版本**
 （事实的形状从库内原型起变更过一次），与 release 标签相互独立。

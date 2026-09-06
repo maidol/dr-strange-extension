@@ -2,7 +2,7 @@
 
 English · [简体中文](README_CN.md)
 
-Parses Rust source into graph facts. Manifest `rust@2`, claims `.rs`.
+Parses Rust source into graph facts. Manifest `rust@3`, claims `.rs`.
 Built on [syn](https://crates.io/crates/syn) — the parser the macro
 ecosystem itself runs on — parse-only: no type inference, no macro
 expansion, which is the point. `@2` is the **fact-format version** (the
